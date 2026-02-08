@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Symbol Equalizer Web Interface</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <i class="fas fa-satellite-dish"></i>
+                <h1>Symbol Equalizer</h1>
+            </div>
+            <div class="status">
+                <div class="status-indicator active">
+                    <span class="dot"></span>
+                    <span>Server Active</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel: Model Selection & Upload -->
+            <div class="left-panel">
+                <!-- Model Selection -->
+                <div class="card model-selection">
+                    <h2><i class="fas fa-brain"></i> Model Selection</h2>
+                    <div class="model-grid">
+                        {% for model in models.models %}
+                        <div class="model-card" data-model-id="{{ model.id }}">
+                            <div class="model-icon">
+                                <i class="fas fa-{{ 'layer-group' if model.type == 'cnn_lstm' else 'stream' if model.type == 'lstm' else 'bolt' }}"></i>
+                            </div>
+                            <h3>{{ model.name }}</h3>
+                            <p class="model-desc">{{ model.description }}</p>
+                            <div class="model-stats">
+                                <span class="stat"><i class="fas fa-calculator"></i> {{ model.parameters }}</span>
+                                <span class="stat"><i class="fas fa-chart-line"></i> {{ model.accuracy }}</span>
+                                <span class="stat"><i class="fas fa-tachometer-alt"></i> {{ model.ber_improvement }}</span>
+                            </div>
+                            <button class="btn-select-model" onclick="selectModel('{{ model.id }}')">
+                                <i class="fas fa-check"></i> Select
+                            </button>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <div class="selected-model-info" id="selectedModelInfo" style="display: none;">
+                        <h3><i class="fas fa-check-circle"></i> Selected Model</h3>
+                        <div id="selectedModelDetails"></div>
+                    </div>
+                </div>
+
+                <!-- File Upload -->
+                <div class="card file-upload">
+                    <h2><i class="fas fa-cloud-upload-alt"></i> Upload Data</h2>
+                    <div class="upload-area" id="uploadArea">
+                        <i class="fas fa-file-csv fa-3x"></i>
+                        <p>Drag & drop your CSV file here</p>
+                        <p class="upload-note">or click to browse</p>
+                        <input type="file" id="fileInput" accept=".csv" style="display: none;">
+                        <button class="btn-browse" onclick="document.getElementById('fileInput').click()">
+                            <i class="fas fa-folder-open"></i> Browse Files
+                        </button>
+                    </div>
+                    <div class="file-info" id="fileInfo" style="display: none;">
+                        <h3><i class="fas fa-file-alt"></i> File Details</h3>
+                        <div id="fileDetails"></div>
+                    </div>
+                </div>
+
+                <!-- Run Inference -->
+                <div class="card run-inference">
+                    <h2><i class="fas fa-play-circle"></i> Run Inference</h2>
+                    <div class="inference-controls">
+                        <div class="control-group">
+                            <label for="batchSize"><i class="fas fa-layer-group"></i> Batch Size</label>
+                            <input type="range" id="batchSize" min="64" max="1024" step="64" value="256">
+                            <span id="batchSizeValue">256</span>
+                        </div>
+                        <div class="control-group">
+                            <label for="deviceSelect"><i class="fas fa-microchip"></i> Device</label>
+                            <select id="deviceSelect">
+                                <option value="auto">Auto (CUDA if available)</option>
+                                <option value="cpu">CPU</option>
+                                <option value="cuda">CUDA</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button class="btn-run" id="runBtn" onclick="runInference()" disabled>
+                        <i class="fas fa-play"></i> Start Inference
+                    </button>
+                    <div class="progress-container" id="progressContainer" style="display: none;">
+                        <div class="progress-header">
+                            <span>Processing...</span>
+                            <span id="progressPercent">0%</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                        <div class="progress-stats">
+                            <span id="progressTime">Elapsed: 0s</span>
+                            <span id="progressStatus">Initializing...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Results & Visualization -->
+            <div class="right-panel">
+                <!-- Results Header -->
+                <div class="results-header">
+                    <h2><i class="fas fa-chart-bar"></i> Results</h2>
+                    <div class="results-actions">
+                        <button class="btn-action" id="downloadBtn" onclick="downloadResults()" disabled>
+                            <i class="fas fa-download"></i> Download CSV
+                        </button>
+                        <button class="btn-action" id="refreshBtn" onclick="refreshResults()">
+                            <i class="fas fa-sync-alt"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Metrics Display -->
+                <div class="card metrics-display">
+                    <h3><i class="fas fa-tachometer-alt"></i> Performance Metrics</h3>
+                    <div class="metrics-grid" id="metricsGrid">
+                        <div class="metric-card">
+                            <div class="metric-icon">
+                                <i class="fas fa-exclamation-triangle"></i>
+                            </div>
+                            <div class="metric-value" id="baselineBER">N/A</div>
+                            <div class="metric-label">Baseline BER</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon">
+                                <i class="fas fa-check-circle"></i>
+                            </div>
+                            <div class="metric-value" id="equalizedBER">N/A</div>
+                            <div class="metric-label">Equalized BER</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon">
+                                <i class="fas fa-chart-line"></i>
+                            </div>
+                            <div class="metric-value" id="improvement">N/A</div>
+                            <div class="metric-label">Improvement</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon">
+                                <i class="fas fa-bolt"></i>
+                            </div>
+                            <div class="metric-value" id="snrGain">N/A</div>
+                            <div class="metric-label">SNR Gain</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Plots Container -->
+                <div class="card plots-container">
+                    <div class="plot-tabs">
+                        <button class="plot-tab active" onclick="switchPlot('constellation')">
+                            <i class="fas fa-star"></i> Constellation
+                        </button>
+                        <button class="plot-tab" onclick="switchPlot('ber')">
+                            <i class="fas fa-chart-bar"></i> BER Comparison
+                        </button>
+                        <button class="plot-tab" onclick="switchPlot('time')">
+                            <i class="fas fa-wave-square"></i> Time Series
+                        </button>
+                    </div>
+                    <div class="plot-area">
+                        <div class="plot-wrapper">
+                            <div id="plotContainer" class="plot-content"></div>
+                            <div class="plot-legend" id="plotLegend"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Detailed Results -->
+                <div class="card detailed-results">
+                    <h3><i class="fas fa-info-circle"></i> Detailed Information</h3>
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="info-label"><i class="fas fa-hashtag"></i> Symbols Processed:</span>
+                            <span class="info-value" id="symbolsCount">0</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label"><i class="fas fa-clock"></i> Processing Time:</span>
+                            <span class="info-value" id="processingTime">0s</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label"><i class="fas fa-project-diagram"></i> Model Type:</span>
+                            <span class="info-value" id="modelType">None</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label"><i class="fas fa-database"></i> Data Status:</span>
+                            <span class="info-value" id="dataStatus">No data</span>
+                        </div>
+                    </div>
+                    <div class="raw-data">
+                        <h4><i class="fas fa-code"></i> Raw Predictions (First 10 symbols)</h4>
+                        <pre id="rawDataPreview">No predictions available</pre>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4><i class="fas fa-cogs"></i> System Status</h4>
+                    <p id="systemStatus">Ready</p>
+                </div>
+                <div class="footer-section">
+                    <h4><i class="fas fa-server"></i> Server Info</h4>
+                    <p>Port: 5000 | Models: {{ models.models|length }}</p>
+                </div>
+                <div class="footer-section">
+                    <h4><i class="fas fa-code"></i> Version</h4>
+                    <p>v1.0.0 | Symbol Equalizer Web</p>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>

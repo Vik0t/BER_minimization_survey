@@ -1,0 +1,40 @@
+{
+  "models": [
+    {
+      "id": "lstm",
+      "name": "LSTM Equalizer",
+      "description": "Bidirectional LSTM with attention mechanism for temporal sequence processing",
+      "file": "lstm_model.pth",
+      "type": "lstm",
+      "parameters": "696K",
+      "accuracy": "97.7%",
+      "ber_improvement": "44.1%",
+      "color": "#6366f1",
+      "icon": "stream"
+    },
+    {
+      "id": "cnn_lstm",
+      "name": "CNN-LSTM Hybrid",
+      "description": "Combines CNN for feature extraction and LSTM for temporal modeling",
+      "file": "cnn_lstm_model.pth",
+      "type": "hybrid",
+      "parameters": "1.2M",
+      "accuracy": "98.2%",
+      "ber_improvement": "52.3%",
+      "color": "#10b981",
+      "icon": "layer-group"
+    },
+    {
+      "id": "light_cnn",
+      "name": "Light CNN",
+      "description": "Lightweight CNN architecture optimized for fast inference",
+      "file": "cnn_light.pth",
+      "type": "cnn",
+      "parameters": "256K",
+      "accuracy": "96.5%",
+      "ber_improvement": "38.7%",
+      "color": "#f59e0b",
+      "icon": "bolt"
+    }
+  ]
+}
