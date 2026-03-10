@@ -80,7 +80,7 @@ function uploadFile(file) {
     formData.append('file', file);
     
     // Показываем индикатор загрузки
-    updateSystemStatus('Uploading file...');
+    updateSystemStatus('Загрузка файла...');
     
     fetch('/api/upload', {
         method: 'POST',
@@ -117,8 +117,8 @@ function uploadFile(file) {
             updateSystemStatus('File uploaded successfully');
             updateRunButtonState();
         } else {
-            alert(`Upload failed: ${data.error}`);
-            updateSystemStatus('Upload failed');
+            alert(`Загрузка не удалась: ${data.error}`);
+            updateSystemStatus('Загрузка не удалась');
         }
     })
     .catch(error => {
@@ -134,7 +134,7 @@ function updateRunButtonState() {
 
 function runInference() {
     if (!currentSession.modelId || !currentSession.fileInfo) {
-        alert('Please select a model and upload a file first');
+        alert('Пожалуйста, выберите модель и загрузите файл');
         return;
     }
     
@@ -167,18 +167,18 @@ function runInference() {
     .then(data => {
         if (data.success) {
             currentSession.resultId = data.result_id;
-            updateSystemStatus('Inference started in background');
+            updateSystemStatus('Обработка запущена в фоне');
             
             // Start polling for results
             startPollingResults(data.result_id);
         } else {
-            alert(`Inference failed to start: ${data.error}`);
+            alert(`Не удалось запустить обработку: ${data.error}`);
             resetProgress();
         }
     })
     .catch(error => {
         console.error('Inference error:', error);
-        updateSystemStatus('Inference failed');
+        updateSystemStatus('Обработка не удалась');
         resetProgress();
     });
 }
@@ -193,7 +193,7 @@ function startPollingResults(resultId) {
     
     pollingInterval = setInterval(() => {
         elapsed += 1;
-        updateProgress(progress, `Processing... (${elapsed}s)`);
+        updateProgress(progress, `Обработка... (${elapsed}s)`);
         
         // Simulate progress (in real app, this would come from server)
         if (progress < 90) {
@@ -210,13 +210,13 @@ function startPollingResults(resultId) {
                         // Inference complete
                         clearInterval(pollingInterval);
                         updateProgress(100, 'Complete!');
-                        updateSystemStatus('Inference completed successfully');
+                        updateSystemStatus('Обработка успешно завершена');
                         displayResults(data.result);
                         document.getElementById('downloadBtn').disabled = false;
                     } else if (data.result.error) {
                         // Error occurred
                         clearInterval(pollingInterval);
-                        updateSystemStatus(`Error: ${data.result.error}`);
+                        updateSystemStatus(`Ошибка: ${data.result.error}`);
                         resetProgress();
                     }
                 }
@@ -376,7 +376,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     
     // Check system status
-    updateSystemStatus('Ready to start');
+    updateSystemStatus('Готов к работе');
     
     // Load models
     fetch('/api/models')

@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Symbol Equalizer Web Interface</title>
+    <title>Веб-интерфейс Symbol Equalizer</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
@@ -15,12 +15,12 @@
         <header class="header">
             <div class="logo">
                 <i class="fas fa-satellite-dish"></i>
-                <h1>Symbol Equalizer</h1>
+                <h1>Эквалайзер Символов</h1>
             </div>
             <div class="status">
                 <div class="status-indicator active">
                     <span class="dot"></span>
-                    <span>Server Active</span>
+                    <span>Сервер Активен</span>
                 </div>
             </div>
         </header>
@@ -31,7 +31,7 @@
             <div class="left-panel">
                 <!-- Model Selection -->
                 <div class="card model-selection">
-                    <h2><i class="fas fa-brain"></i> Model Selection</h2>
+                    <h2><i class="fas fa-brain"></i> Выбор модели</h2>
                     <div class="model-grid">
                         {% for model in models.models %}
                         <div class="model-card" data-model-id="{{ model.id }}">
@@ -46,59 +46,59 @@
                                 <span class="stat"><i class="fas fa-tachometer-alt"></i> {{ model.ber_improvement }}</span>
                             </div>
                             <button class="btn-select-model" onclick="selectModel('{{ model.id }}')">
-                                <i class="fas fa-check"></i> Select
+                                <i class="fas fa-check"></i> Выбрать
                             </button>
                         </div>
                         {% endfor %}
                     </div>
                     <div class="selected-model-info" id="selectedModelInfo" style="display: none;">
-                        <h3><i class="fas fa-check-circle"></i> Selected Model</h3>
+                        <h3><i class="fas fa-check-circle"></i> Выбранная модель</h3>
                         <div id="selectedModelDetails"></div>
                     </div>
                 </div>
 
                 <!-- File Upload -->
                 <div class="card file-upload">
-                    <h2><i class="fas fa-cloud-upload-alt"></i> Upload Data</h2>
+                    <h2><i class="fas fa-cloud-upload-alt"></i> Загрузка данных</h2>
                     <div class="upload-area" id="uploadArea">
                         <i class="fas fa-file-csv fa-3x"></i>
-                        <p>Drag & drop your CSV file here</p>
-                        <p class="upload-note">or click to browse</p>
+                        <p>Перетащите CSV файл сюда</p>
+                        <p class="upload-note">или нажмите для выбора</p>
                         <input type="file" id="fileInput" accept=".csv" style="display: none;">
                         <button class="btn-browse" onclick="document.getElementById('fileInput').click()">
-                            <i class="fas fa-folder-open"></i> Browse Files
+                            <i class="fas fa-folder-open"></i> Выбрать файл
                         </button>
                     </div>
                     <div class="file-info" id="fileInfo" style="display: none;">
-                        <h3><i class="fas fa-file-alt"></i> File Details</h3>
+                        <h3><i class="fas fa-file-alt"></i> Детали файла</h3>
                         <div id="fileDetails"></div>
                     </div>
                 </div>
 
                 <!-- Run Inference -->
                 <div class="card run-inference">
-                    <h2><i class="fas fa-play-circle"></i> Run Inference</h2>
+                    <h2><i class="fas fa-play-circle"></i> Запустить обработку</h2>
                     <div class="inference-controls">
                         <div class="control-group">
-                            <label for="batchSize"><i class="fas fa-layer-group"></i> Batch Size</label>
+                            <label for="batchSize"><i class="fas fa-layer-group"></i> Размер пакета</label>
                             <input type="range" id="batchSize" min="64" max="1024" step="64" value="256">
                             <span id="batchSizeValue">256</span>
                         </div>
                         <div class="control-group">
-                            <label for="deviceSelect"><i class="fas fa-microchip"></i> Device</label>
+                            <label for="deviceSelect"><i class="fas fa-microchip"></i> Устройство</label>
                             <select id="deviceSelect">
-                                <option value="auto">Auto (CUDA if available)</option>
+                                <option value="auto">Авто (CUDA если доступно)</option>
                                 <option value="cpu">CPU</option>
                                 <option value="cuda">CUDA</option>
                             </select>
                         </div>
                     </div>
                     <button class="btn-run" id="runBtn" onclick="runInference()" disabled>
-                        <i class="fas fa-play"></i> Start Inference
+                        <i class="fas fa-play"></i> Начать обработку
                     </button>
                     <div class="progress-container" id="progressContainer" style="display: none;">
                         <div class="progress-header">
-                            <span>Processing...</span>
+                            <span>Обработка...</span>
                             <span id="progressPercent">0%</span>
                         </div>
                         <div class="progress-bar">
@@ -116,48 +116,48 @@
             <div class="right-panel">
                 <!-- Results Header -->
                 <div class="results-header">
-                    <h2><i class="fas fa-chart-bar"></i> Results</h2>
+                    <h2><i class="fas fa-chart-bar"></i> Результаты</h2>
                     <div class="results-actions">
                         <button class="btn-action" id="downloadBtn" onclick="downloadResults()" disabled>
-                            <i class="fas fa-download"></i> Download CSV
+                            <i class="fas fa-download"></i> Скачать CSV
                         </button>
                         <button class="btn-action" id="refreshBtn" onclick="refreshResults()">
-                            <i class="fas fa-sync-alt"></i> Refresh
+                            <i class="fas fa-sync-alt"></i> Обновить
                         </button>
                     </div>
                 </div>
 
                 <!-- Metrics Display -->
                 <div class="card metrics-display">
-                    <h3><i class="fas fa-tachometer-alt"></i> Performance Metrics</h3>
+                    <h3><i class="fas fa-tachometer-alt"></i> Метрики производительности</h3>
                     <div class="metrics-grid" id="metricsGrid">
                         <div class="metric-card">
                             <div class="metric-icon">
                                 <i class="fas fa-exclamation-triangle"></i>
                             </div>
                             <div class="metric-value" id="baselineBER">N/A</div>
-                            <div class="metric-label">Baseline BER</div>
+                            <div class="metric-label">Базовый BER</div>
                         </div>
                         <div class="metric-card">
                             <div class="metric-icon">
                                 <i class="fas fa-check-circle"></i>
                             </div>
                             <div class="metric-value" id="equalizedBER">N/A</div>
-                            <div class="metric-label">Equalized BER</div>
+                            <div class="metric-label">Выровненный BER</div>
                         </div>
                         <div class="metric-card">
                             <div class="metric-icon">
                                 <i class="fas fa-chart-line"></i>
                             </div>
                             <div class="metric-value" id="improvement">N/A</div>
-                            <div class="metric-label">Improvement</div>
+                            <div class="metric-label">Улучшение</div>
                         </div>
                         <div class="metric-card">
                             <div class="metric-icon">
                                 <i class="fas fa-bolt"></i>
                             </div>
                             <div class="metric-value" id="snrGain">N/A</div>
-                            <div class="metric-label">SNR Gain</div>
+                            <div class="metric-label">Усиление SNR</div>
                         </div>
                     </div>
                 </div>
@@ -166,13 +166,13 @@
                 <div class="card plots-container">
                     <div class="plot-tabs">
                         <button class="plot-tab active" onclick="switchPlot('constellation')">
-                            <i class="fas fa-star"></i> Constellation
+                            <i class="fas fa-star"></i> Созвездие
                         </button>
                         <button class="plot-tab" onclick="switchPlot('ber')">
-                            <i class="fas fa-chart-bar"></i> BER Comparison
+                            <i class="fas fa-chart-bar"></i> Сравнение BER
                         </button>
                         <button class="plot-tab" onclick="switchPlot('time')">
-                            <i class="fas fa-wave-square"></i> Time Series
+                            <i class="fas fa-wave-square"></i> Временной ряд
                         </button>
                     </div>
                     <div class="plot-area">
@@ -185,28 +185,28 @@
 
                 <!-- Detailed Results -->
                 <div class="card detailed-results">
-                    <h3><i class="fas fa-info-circle"></i> Detailed Information</h3>
+                    <h3><i class="fas fa-info-circle"></i> Детальная информация</h3>
                     <div class="info-grid">
                         <div class="info-item">
-                            <span class="info-label"><i class="fas fa-hashtag"></i> Symbols Processed:</span>
+                            <span class="info-label"><i class="fas fa-hashtag"></i> Обработано символов:</span>
                             <span class="info-value" id="symbolsCount">0</span>
                         </div>
                         <div class="info-item">
-                            <span class="info-label"><i class="fas fa-clock"></i> Processing Time:</span>
+                            <span class="info-label"><i class="fas fa-clock"></i> Время обработки:</span>
                             <span class="info-value" id="processingTime">0s</span>
                         </div>
                         <div class="info-item">
-                            <span class="info-label"><i class="fas fa-project-diagram"></i> Model Type:</span>
-                            <span class="info-value" id="modelType">None</span>
+                            <span class="info-label"><i class="fas fa-project-diagram"></i> Тип модели:</span>
+                            <span class="info-value" id="modelType">Нет</span>
                         </div>
                         <div class="info-item">
-                            <span class="info-label"><i class="fas fa-database"></i> Data Status:</span>
-                            <span class="info-value" id="dataStatus">No data</span>
+                            <span class="info-label"><i class="fas fa-database"></i> Статус данных:</span>
+                            <span class="info-value" id="dataStatus">Нет данных</span>
                         </div>
                     </div>
                     <div class="raw-data">
-                        <h4><i class="fas fa-code"></i> Raw Predictions (First 10 symbols)</h4>
-                        <pre id="rawDataPreview">No predictions available</pre>
+                        <h4><i class="fas fa-code"></i> Необработанные прогнозы (Первые 10 символов)</h4>
+                        <pre id="rawDataPreview">Нет доступных прогнозов</pre>
                     </div>
                 </div>
             </div>
@@ -216,16 +216,16 @@
         <footer class="footer">
             <div class="footer-content">
                 <div class="footer-section">
-                    <h4><i class="fas fa-cogs"></i> System Status</h4>
-                    <p id="systemStatus">Ready</p>
+                    <h4><i class="fas fa-cogs"></i> Статус системы</h4>
+                    <p id="systemStatus">Готов</p>
                 </div>
                 <div class="footer-section">
-                    <h4><i class="fas fa-server"></i> Server Info</h4>
-                    <p>Port: 5000 | Models: {{ models.models|length }}</p>
+                    <h4><i class="fas fa-server"></i> Информация о сервере</h4>
+                    <p>Порт: 5001 | Модели: {{ models.models|length }}</p>
                 </div>
                 <div class="footer-section">
-                    <h4><i class="fas fa-code"></i> Version</h4>
-                    <p>v1.0.0 | Symbol Equalizer Web</p>
+                    <h4><i class="fas fa-code"></i> Версия</h4>
+                    <p>v1.0.0 | Веб Symbol Equalizer</p>
                 </div>
             </div>
         </footer>
