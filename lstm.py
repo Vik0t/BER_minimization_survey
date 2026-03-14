@@ -33,7 +33,7 @@ class Config:
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-4
     TRAIN_BLOCK_SIZE = 131072
-    EVAL_BATCH_SIZE = 262144
+    EVAL_BATCH_SIZE = 131072
     MIN_BLOCK_SIZE = 4096
     USE_AMP = True
     USE_TORCH_COMPILE = False
@@ -151,7 +151,7 @@ class LSTMRxEqualizer(nn.Module):
             nn.LayerNorm(Config.HIDDEN_DIM // 2),
             nn.GELU(),
             nn.Dropout(Config.DROPOUT * 0.5),
-            nn.Linear(Config.HIDDEN_DIM // 2, 16),
+            nn.Linear(Config.HIDDEN_DIM // 2, 2),
         )
         self._init_weights()
 
@@ -219,7 +219,7 @@ class HybridCNNLSTMEqualizer(nn.Module):
             nn.LayerNorm(Config.HIDDEN_DIM),
             nn.GELU(),
             nn.Dropout(Config.DROPOUT),
-            nn.Linear(Config.HIDDEN_DIM, 16),
+            nn.Linear(Config.HIDDEN_DIM, 2),
         )
         self._init_weights()
 
@@ -255,7 +255,7 @@ class MLPRxEqualizer(nn.Module):
             nn.LayerNorm(Config.HIDDEN_DIM // 2),
             nn.GELU(),
             nn.Dropout(Config.DROPOUT * 0.5),
-            nn.Linear(Config.HIDDEN_DIM // 2, 16),
+            nn.Linear(Config.HIDDEN_DIM // 2, 2),
         )
         self._init_weights()
 
@@ -348,12 +348,12 @@ def load_files(base_dir: Path, file_indices: List[int]) -> Tuple[torch.Tensor, t
     return torch.cat(tx_list, dim=0), torch.cat(rx_list, dim=0)
 
 
-def make_windows(rx_symbols: torch.Tensor, tx_classes: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def make_windows(rx_symbols: torch.Tensor, tx_symbols: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     norm_rx = (rx_symbols - mean) / std
     norm_rx = torch.nan_to_num(norm_rx, nan=0.0, posinf=0.0, neginf=0.0)
     window_view = norm_rx.unfold(0, Config.SEQ_LEN, 1).permute(0, 2, 1).contiguous()
     x = window_view.view(window_view.size(0), -1).contiguous()
-    y = tx_classes[Config.CONTEXT_K : tx_classes.size(0) - Config.CONTEXT_K].contiguous()
+    y = tx_symbols[Config.CONTEXT_K : tx_symbols.size(0) - Config.CONTEXT_K].contiguous()
     return x, y
 
 
@@ -369,17 +369,13 @@ def prepare_data() -> Dict[str, torch.Tensor]:
     tx_val, rx_val = load_files(base_dir, val_idx)
     tx_test, rx_test = load_files(base_dir, test_idx)
 
-    train_classes = symbols_to_classes(tx_train.to(Config.DEVICE)).cpu()
-    val_classes = symbols_to_classes(tx_val.to(Config.DEVICE)).cpu()
-    test_classes = symbols_to_classes(tx_test.to(Config.DEVICE)).cpu()
-
     mean = rx_train.mean(dim=0, keepdim=True)
     std = rx_train.std(dim=0, keepdim=True)
     std[std == 0] = 1.0
 
-    train_x, train_y = make_windows(rx_train, train_classes, mean, std)
-    val_x, val_y = make_windows(rx_val, val_classes, mean, std)
-    test_x, test_y = make_windows(rx_test, test_classes, mean, std)
+    train_x, train_y = make_windows(rx_train, tx_train, mean, std)
+    val_x, val_y = make_windows(rx_val, tx_val, mean, std)
+    test_x, test_y = make_windows(rx_test, tx_test, mean, std)
 
     return {
         "train_x": train_x,
@@ -421,7 +417,7 @@ def iter_tensor_batches(x: torch.Tensor, y: torch.Tensor, batch_size: int, shuff
 @torch.inference_mode()
 def evaluate_split(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int) -> Tuple[float, float, float]:
     model.eval()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.MSELoss()
     bit_labels = BIT_LABELS.to(Config.DEVICE)
     current_batch_size = batch_size
 
@@ -435,15 +431,16 @@ def evaluate_split(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_siz
             for xb, yb in iter_tensor_batches(x, y, batch_size=current_batch_size, shuffle=False):
                 with autocast_context():
                     mark_cudagraph_step_begin()
-                    logits = model(xb)
-                    loss = criterion(logits, yb)
-                preds = logits.argmax(dim=1)
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
+                pred_classes = symbols_to_classes(preds.float())
+                target_classes = symbols_to_classes(yb.float())
                 batch_size_now = yb.size(0)
                 total_loss += loss.item() * batch_size_now
                 total_samples += batch_size_now
-                correct += (preds == yb).sum().item()
-                tx_bits = bit_labels[yb]
-                rx_bits = bit_labels[preds]
+                correct += (pred_classes == target_classes).sum().item()
+                tx_bits = bit_labels[target_classes]
+                rx_bits = bit_labels[pred_classes]
                 bit_errors += (tx_bits != rx_bits).sum().item()
                 total_bits += tx_bits.numel()
             return (
@@ -596,7 +593,7 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         optimizer_kwargs.pop("fused", None)
         optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler("cuda", enabled=Config.DEVICE.type == "cuda" and Config.USE_AMP)
     best_train_loss = float("inf")
     steps_wo_min = 0
@@ -640,8 +637,8 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
                 optimizer.zero_grad(set_to_none=True)
                 with autocast_context():
                     mark_cudagraph_step_begin()
-                    logits = model(xb)
-                    loss = criterion(logits, yb)
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
