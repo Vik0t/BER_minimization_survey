@@ -1,14 +1,12 @@
 import time
-from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 
@@ -18,7 +16,7 @@ class Config:
     )
     DATA_DIR_CANDIDATES = [Path("symbols_new"), Path("Symbols_1m_1ch_PR"), Path(".")]
     MAX_FILES = 32
-    TRAIN_PORTION = 0.97
+    TRAIN_PORTION = 0.97  # MXNet notebook split: last train file goes to val, rest to test.
 
     CONTEXT_K = 20
     SEQ_LEN = 2 * CONTEXT_K + 1
@@ -30,16 +28,11 @@ class Config:
     LSTM_LAYERS = 2
     BIDIRECTIONAL = True
     USE_ATTENTION = True
-    TRANSFORMER_DIM = 128
-    TRANSFORMER_LAYERS = 4
-    TRANSFORMER_HEADS = 4
-    TRANSFORMER_FF_DIM = 256
-    TRANSFORMER_CONV_KERNEL = 3
 
-    EPOCHS = 50
+    EPOCHS = 250
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-4
-    TRAIN_BLOCK_SIZE = 32768
+    TRAIN_BLOCK_SIZE = 131072
     EVAL_BATCH_SIZE = 131072
     MIN_BLOCK_SIZE = 4096
     USE_AMP = True
@@ -47,17 +40,13 @@ class Config:
     TORCH_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
     DECAY_STEPS = 20
-    MIN_LR = 1e-5
+    MIN_LR = 1e-4
     LOG_EVERY = 5
     TEST_BER_EVERY = 10
 
     OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["lstm", "cnn_lstm", "transformer", "mlp"]
+    MODEL_TYPES = ["lstm", "cnn_lstm", "mlp"]
     SAVE_BEST = True
-    RUN_SWEEP_EXPERIMENTS = False
-    SWEEP_TEST_FILES = 1
-    WINDOW_SWEEP_VALUES = [2, 4, 8, 12, 16, 20]
-    HIDDEN_SWEEP_VALUES = [8, 16, 32, 64]
 
 
 if Config.DEVICE.type == "cuda":
@@ -249,109 +238,6 @@ class HybridCNNLSTMEqualizer(nn.Module):
         return self.classifier(x)
 
 
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, dim: int, heads: int, ff_dim: int):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=heads,
-            dropout=Config.DROPOUT,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        self.local_mixer = nn.Sequential(
-            nn.Conv1d(
-                dim,
-                dim,
-                kernel_size=Config.TRANSFORMER_CONV_KERNEL,
-                padding=Config.TRANSFORMER_CONV_KERNEL // 2,
-                groups=dim,
-            ),
-            nn.GELU(),
-            nn.Conv1d(dim, dim, kernel_size=1),
-        )
-        self.norm3 = nn.LayerNorm(dim)
-        self.ff_in = nn.Linear(dim, ff_dim * 2)
-        self.ff_out = nn.Linear(ff_dim, dim)
-        self.dropout = nn.Dropout(Config.DROPOUT)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_in = self.norm1(x)
-        with sdpa_context():
-            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-        x = x + self.dropout(attn_out)
-
-        local_in = self.norm2(x).transpose(1, 2)
-        local_out = self.local_mixer(local_in).transpose(1, 2)
-        x = x + self.dropout(local_out)
-
-        ff_in = self.norm3(x)
-        value, gate = self.ff_in(ff_in).chunk(2, dim=-1)
-        ff_out = self.ff_out(value * F.gelu(gate))
-        return x + self.dropout(ff_out)
-
-
-class TransformerRxEqualizer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        dim = Config.TRANSFORMER_DIM
-        self.input_proj = nn.Linear(Config.INPUT_DIM, dim)
-        self.pos_embedding = nn.Parameter(torch.zeros(1, Config.SEQ_LEN, dim))
-        self.input_dropout = nn.Dropout(Config.DROPOUT * 0.5)
-        self.blocks = nn.ModuleList(
-            [
-                TransformerEncoderBlock(
-                    dim=dim,
-                    heads=Config.TRANSFORMER_HEADS,
-                    ff_dim=Config.TRANSFORMER_FF_DIM,
-                )
-                for _ in range(Config.TRANSFORMER_LAYERS)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(dim)
-        self.center_fusion = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-        )
-        self.regressor = nn.Sequential(
-            nn.Linear(dim, Config.HIDDEN_DIM),
-            nn.LayerNorm(Config.HIDDEN_DIM),
-            nn.GELU(),
-            nn.Dropout(Config.DROPOUT),
-            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
-            nn.LayerNorm(Config.HIDDEN_DIM // 2),
-            nn.GELU(),
-            nn.Dropout(Config.DROPOUT * 0.5),
-            nn.Linear(Config.HIDDEN_DIM // 2, 2),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d)):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.constant_(module.bias, 0.0)
-                nn.init.constant_(module.weight, 1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
-        x = self.input_proj(x)
-        x = self.input_dropout(x + self.pos_embedding)
-        for block in self.blocks:
-            x = block(x)
-        x = self.final_norm(x)
-        center = x[:, Config.CONTEXT_K, :]
-        global_context = x.mean(dim=1)
-        fused = self.center_fusion(torch.cat([center, global_context], dim=1))
-        return self.regressor(fused)
-
-
 class MLPRxEqualizer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -409,18 +295,6 @@ def autocast_context():
         dtype=torch.float16,
         enabled=Config.DEVICE.type == "cuda" and Config.USE_AMP,
     )
-
-
-def sdpa_context():
-    if Config.DEVICE.type != "cuda":
-        return nullcontext()
-    attention_mod = getattr(torch.nn, "attention", None)
-    if attention_mod is not None and hasattr(attention_mod, "sdpa_kernel") and hasattr(attention_mod, "SDPBackend"):
-        return attention_mod.sdpa_kernel([attention_mod.SDPBackend.MATH])
-    cuda_backends = getattr(torch.backends, "cuda", None)
-    if cuda_backends is not None and hasattr(cuda_backends, "sdp_kernel"):
-        return cuda_backends.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-    return nullcontext()
 
 
 def symbols_to_classes(symbols: torch.Tensor) -> torch.Tensor:
@@ -483,13 +357,9 @@ def make_windows(rx_symbols: torch.Tensor, tx_symbols: torch.Tensor, mean: torch
     return x, y
 
 
-def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor]:
+def prepare_data() -> Dict[str, torch.Tensor]:
     base_dir, all_indices = discover_symbol_files()
     train_idx, val_idx, test_idx = resolve_splits(all_indices)
-    if max_test_files is not None:
-        test_idx = test_idx[:max_test_files]
-        if not test_idx:
-            raise ValueError("max_test_files truncated test split to zero files.")
     log(f"Data dir: {base_dir}")
     log(f"Train files: {train_idx}")
     log(f"Val files: {val_idx}")
@@ -526,8 +396,6 @@ def make_model(name: str) -> nn.Module:
         return LSTMRxEqualizer().to(Config.DEVICE)
     if name in {"hybrid", "cnn_lstm"}:
         return HybridCNNLSTMEqualizer().to(Config.DEVICE)
-    if name == "transformer":
-        return TransformerRxEqualizer().to(Config.DEVICE)
     if name == "mlp":
         return MLPRxEqualizer().to(Config.DEVICE)
     raise ValueError(f"Unknown model: {name}")
@@ -547,7 +415,7 @@ def iter_tensor_batches(x: torch.Tensor, y: torch.Tensor, batch_size: int, shuff
 
 
 @torch.inference_mode()
-def evaluate_split(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int) -> Tuple[float, float, float, int]:
+def evaluate_split(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int) -> Tuple[float, float, float]:
     model.eval()
     criterion = nn.MSELoss()
     bit_labels = BIT_LABELS.to(Config.DEVICE)
@@ -579,7 +447,6 @@ def evaluate_split(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_siz
                 total_loss / max(total_samples, 1),
                 correct / max(total_samples, 1),
                 bit_errors / max(total_bits, 1),
-                current_batch_size,
             )
         except RuntimeError as error:
             if Config.DEVICE.type != "cuda" or not is_cuda_oom(error):
@@ -598,16 +465,13 @@ def compute_test_metrics(model: nn.Module, data: Dict[str, torch.Tensor]) -> Dic
     rx_cls = symbols_to_classes(data["rx_test"].to(Config.DEVICE))
     baseline_ber = calculate_ber_from_classes(tx_cls, rx_cls)
     eval_batch_size = data.get("eval_batch_size", Config.EVAL_BATCH_SIZE)
-    test_loss, test_acc, test_ber, safe_eval_batch_size = evaluate_split(
-        model, data["test_x"], data["test_y"], eval_batch_size
-    )
+    test_loss, test_acc, test_ber = evaluate_split(model, data["test_x"], data["test_y"], eval_batch_size)
     return {
         "baseline_ber": baseline_ber,
         "equalized_ber": test_ber,
         "accuracy": test_acc,
         "ser": 1.0 - test_acc,
         "test_loss": test_loss,
-        "safe_eval_batch_size": safe_eval_batch_size,
         "improvement_abs": baseline_ber - test_ber,
         "improvement_rel": (1 - test_ber / baseline_ber) * 100 if baseline_ber > 0 else 0.0,
         "improvement_db": 10 * np.log10(baseline_ber / test_ber) if test_ber > 0 else float("inf"),
@@ -711,112 +575,6 @@ def plot_architecture_summary(results: List[Dict[str, float]]):
     summary.to_csv(Config.OUT_DIR / "architecture_comparison.csv", index=False)
 
 
-def plot_sweep_per_model(df: pd.DataFrame, x_col: str, x_label: str, filename_prefix: str):
-    for model_name in Config.MODEL_TYPES:
-        model_df = df[df["model_type"] == model_name].sort_values(x_col)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(model_df[x_col], model_df["equalized_ber"], marker="o", linewidth=2)
-        ax.set_title(f"{model_name.upper()} - BER vs {x_label}", fontweight="bold")
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("BER")
-        ax.set_yscale("log")
-        ax.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(Config.OUT_DIR / f"{filename_prefix}_{model_name}.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-
-def plot_sweep_overlay(df: pd.DataFrame, x_col: str, x_label: str, filename: str):
-    fig, ax = plt.subplots(figsize=(9, 6))
-    for model_name in Config.MODEL_TYPES:
-        model_df = df[df["model_type"] == model_name].sort_values(x_col)
-        ax.plot(model_df[x_col], model_df["equalized_ber"], marker="o", linewidth=2, label=model_name.upper())
-    ax.set_title(f"BER vs {x_label} - All Models", fontweight="bold")
-    ax.set_xlabel(x_label)
-    ax.set_ylabel("BER")
-    ax.set_yscale("log")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) -> Dict[str, float]:
-    tracked_keys = [
-        "CONTEXT_K",
-        "SEQ_LEN",
-        "HIDDEN_DIM",
-        "LSTM_HIDDEN",
-        "SAVE_BEST",
-    ]
-    previous = {key: getattr(Config, key) for key in tracked_keys}
-    try:
-        for key, value in overrides.items():
-            setattr(Config, key, value)
-        Config.SEQ_LEN = 2 * Config.CONTEXT_K + 1
-        Config.SAVE_BEST = False
-        data = prepare_data(max_test_files=max_test_files)
-        model, _, results = train_one_model(model_name, data)
-        if Config.DEVICE.type == "cuda":
-            model.to("cpu")
-            del model
-            torch.cuda.empty_cache()
-        return results
-    finally:
-        for key, value in previous.items():
-            setattr(Config, key, value)
-
-
-def run_sweep_experiments():
-    log("\nRunning BER sweep experiments on one test file...")
-    window_rows: List[Dict[str, float]] = []
-    hidden_rows: List[Dict[str, float]] = []
-
-    for model_name in Config.MODEL_TYPES:
-        for context_k in Config.WINDOW_SWEEP_VALUES:
-            log(f"sweep | {model_name} | window={context_k}")
-            results = run_model_with_overrides(
-                model_name,
-                max_test_files=Config.SWEEP_TEST_FILES,
-                CONTEXT_K=context_k,
-            )
-            window_rows.append(
-                {
-                    "model_type": model_name,
-                    "context_k": context_k,
-                    "seq_len": 2 * context_k + 1,
-                    **results,
-                }
-            )
-
-        for hidden_size in Config.HIDDEN_SWEEP_VALUES:
-            log(f"sweep | {model_name} | hidden={hidden_size}")
-            results = run_model_with_overrides(
-                model_name,
-                max_test_files=Config.SWEEP_TEST_FILES,
-                HIDDEN_DIM=hidden_size,
-                LSTM_HIDDEN=hidden_size,
-            )
-            hidden_rows.append(
-                {
-                    "model_type": model_name,
-                    "hidden_size": hidden_size,
-                    **results,
-                }
-            )
-
-    window_df = pd.DataFrame(window_rows)
-    hidden_df = pd.DataFrame(hidden_rows)
-    window_df.to_csv(Config.OUT_DIR / "ber_vs_window.csv", index=False)
-    hidden_df.to_csv(Config.OUT_DIR / "ber_vs_hidden.csv", index=False)
-
-    plot_sweep_per_model(window_df, x_col="seq_len", x_label="Window Size", filename_prefix="ber_vs_window")
-    plot_sweep_per_model(hidden_df, x_col="hidden_size", x_label="Hidden Size", filename_prefix="ber_vs_hidden")
-    plot_sweep_overlay(window_df, x_col="seq_len", x_label="Window Size", filename="ber_vs_window_overlay.png")
-    plot_sweep_overlay(hidden_df, x_col="hidden_size", x_label="Hidden Size", filename="ber_vs_hidden_overlay.png")
-
-
 def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
     model = make_model(model_name)
     if Config.USE_TORCH_COMPILE and hasattr(torch, "compile"):
@@ -838,7 +596,6 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler("cuda", enabled=Config.DEVICE.type == "cuda" and Config.USE_AMP)
     best_train_loss = float("inf")
-    best_val_ber = float("inf")
     steps_wo_min = 0
     best_state = None
     best_test_metrics = None
@@ -868,46 +625,43 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         epoch_start = time.time()
         running_loss = 0.0
         seen = 0
-        total_train = train_x.size(0)
-        num_blocks = (total_train + train_block_size - 1) // train_block_size
-        block_order = torch.randperm(num_blocks).tolist()
-        for block_idx in block_order:
-            block_start = block_idx * train_block_size
-            block_end = min(block_start + train_block_size, total_train)
-            start = block_start
-            while start < block_end:
-                end = min(start + train_block_size, block_end)
-                xb = train_x[start:end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
-                yb = train_y[start:end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
-                try:
-                    optimizer.zero_grad(set_to_none=True)
-                    with autocast_context():
-                        mark_cudagraph_step_begin()
-                        preds = model(xb)
-                        loss = criterion(preds, yb)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    batch_size_now = yb.size(0)
-                    running_loss += loss.item() * batch_size_now
-                    seen += batch_size_now
-                    start = end
-                except RuntimeError as error:
-                    if Config.DEVICE.type != "cuda" or not is_cuda_oom(error):
-                        raise
-                    optimizer.zero_grad(set_to_none=True)
-                    if train_block_size <= Config.MIN_BLOCK_SIZE:
-                        raise
-                    next_block_size = max(train_block_size // 2, Config.MIN_BLOCK_SIZE)
-                    log(f"{model_name} | CUDA OOM at train_block_size={train_block_size}, retrying with {next_block_size}")
-                    train_block_size = next_block_size
-                    torch.cuda.empty_cache()
+        order = torch.randperm(train_x.size(0))
+        shuffled_x = train_x.index_select(0, order)
+        shuffled_y = train_y.index_select(0, order)
+        start = 0
+        while start < shuffled_x.size(0):
+            end = min(start + train_block_size, shuffled_x.size(0))
+            xb = shuffled_x[start:end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
+            yb = shuffled_y[start:end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
+            try:
+                optimizer.zero_grad(set_to_none=True)
+                with autocast_context():
+                    mark_cudagraph_step_begin()
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                batch_size_now = yb.size(0)
+                running_loss += loss.item() * batch_size_now
+                seen += batch_size_now
+                start = end
+            except RuntimeError as error:
+                if Config.DEVICE.type != "cuda" or not is_cuda_oom(error):
+                    raise
+                optimizer.zero_grad(set_to_none=True)
+                if train_block_size <= Config.MIN_BLOCK_SIZE:
+                    raise
+                next_block_size = max(train_block_size // 2, Config.MIN_BLOCK_SIZE)
+                log(f"{model_name} | CUDA OOM at train_block_size={train_block_size}, retrying with {next_block_size}")
+                train_block_size = next_block_size
+                torch.cuda.empty_cache()
 
         train_loss = running_loss / max(seen, 1)
         epoch_time = time.time() - epoch_start
         speed = seen / max(epoch_time, 1e-9)
 
-        val_loss, val_acc, val_ber, eval_batch_size = evaluate_split(model, data["val_x"], data["val_y"], eval_batch_size)
+        val_loss, val_acc, val_ber = evaluate_split(model, data["val_x"], data["val_y"], eval_batch_size)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
@@ -919,7 +673,6 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
 
         if (epoch + 1) % Config.TEST_BER_EVERY == 0 or epoch == 0 or epoch == Config.EPOCHS - 1:
             test_metrics = compute_test_metrics(model, {**data, "eval_batch_size": eval_batch_size})
-            eval_batch_size = int(test_metrics["safe_eval_batch_size"])
             history["test_loss"].append(test_metrics["test_loss"])
             history["test_acc"].append(test_metrics["accuracy"])
             history["test_ber"].append(test_metrics["equalized_ber"])
@@ -941,14 +694,11 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         if train_loss < best_train_loss:
             best_train_loss = train_loss
             steps_wo_min = 0
-        else:
-            steps_wo_min += 1
-
-        if val_ber < best_val_ber:
-            best_val_ber = val_ber
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if Config.SAVE_BEST:
                 torch.save(best_state, Config.OUT_DIR / f"{model_name}_best.pth")
+        else:
+            steps_wo_min += 1
 
         if steps_wo_min >= Config.DECAY_STEPS:
             steps_wo_min = 0
@@ -994,9 +744,6 @@ def main():
 
     plot_architecture_summary(all_results)
     log(f"Saved summary: {Config.OUT_DIR / 'architecture_comparison.csv'}")
-
-    if Config.RUN_SWEEP_EXPERIMENTS:
-        run_sweep_experiments()
 
 
 if __name__ == "__main__":
