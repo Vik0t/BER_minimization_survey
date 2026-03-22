@@ -34,7 +34,9 @@ class Config:
     TRANSFORMER_LAYERS = 4
     TRANSFORMER_HEADS = 4
     TRANSFORMER_FF_DIM = 256
-    TRANSFORMER_CONV_KERNEL = 3
+    TRANSFORMER_USE_LOCAL_MIXER = False
+    TRANSFORMER_TRAIN_BLOCK_SIZE = 8192
+    TRANSFORMER_EVAL_BATCH_SIZE = 32768
 
     EPOCHS = 50
     LEARNING_RATE = 1e-3
@@ -260,17 +262,19 @@ class TransformerEncoderBlock(nn.Module):
             batch_first=True,
         )
         self.norm2 = nn.LayerNorm(dim)
-        self.local_mixer = nn.Sequential(
-            nn.Conv1d(
-                dim,
-                dim,
-                kernel_size=Config.TRANSFORMER_CONV_KERNEL,
-                padding=Config.TRANSFORMER_CONV_KERNEL // 2,
-                groups=dim,
-            ),
-            nn.GELU(),
-            nn.Conv1d(dim, dim, kernel_size=1),
-        )
+        self.use_local_mixer = Config.TRANSFORMER_USE_LOCAL_MIXER
+        if self.use_local_mixer:
+            self.local_mixer = nn.Sequential(
+                nn.Conv1d(
+                    dim,
+                    dim,
+                    kernel_size=Config.TRANSFORMER_CONV_KERNEL,
+                    padding=Config.TRANSFORMER_CONV_KERNEL // 2,
+                    groups=dim,
+                ),
+                nn.GELU(),
+                nn.Conv1d(dim, dim, kernel_size=1),
+            )
         self.norm3 = nn.LayerNorm(dim)
         self.ff_in = nn.Linear(dim, ff_dim * 2)
         self.ff_out = nn.Linear(ff_dim, dim)
@@ -282,9 +286,10 @@ class TransformerEncoderBlock(nn.Module):
             attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         x = x + self.dropout(attn_out)
 
-        local_in = self.norm2(x).transpose(1, 2)
-        local_out = self.local_mixer(local_in).transpose(1, 2)
-        x = x + self.dropout(local_out)
+        if self.use_local_mixer:
+            local_in = self.norm2(x).transpose(1, 2)
+            local_out = self.local_mixer(local_in).transpose(1, 2)
+            x = x + self.dropout(local_out)
 
         ff_in = self.norm3(x)
         value, gate = self.ff_in(ff_in).chunk(2, dim=-1)
@@ -416,10 +421,17 @@ def sdpa_context():
         return nullcontext()
     attention_mod = getattr(torch.nn, "attention", None)
     if attention_mod is not None and hasattr(attention_mod, "sdpa_kernel") and hasattr(attention_mod, "SDPBackend"):
-        return attention_mod.sdpa_kernel([attention_mod.SDPBackend.MATH])
+        backends = []
+        if hasattr(attention_mod.SDPBackend, "EFFICIENT_ATTENTION"):
+            backends.append(attention_mod.SDPBackend.EFFICIENT_ATTENTION)
+        backends.append(attention_mod.SDPBackend.MATH)
+        try:
+            return attention_mod.sdpa_kernel(backends, set_priority=True)
+        except TypeError:
+            return attention_mod.sdpa_kernel(backends)
     cuda_backends = getattr(torch.backends, "cuda", None)
     if cuda_backends is not None and hasattr(cuda_backends, "sdp_kernel"):
-        return cuda_backends.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+        return cuda_backends.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=True)
     return nullcontext()
 
 
@@ -862,6 +874,9 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
     train_y = data["train_y"]
     train_block_size = Config.TRAIN_BLOCK_SIZE
     eval_batch_size = Config.EVAL_BATCH_SIZE
+    if model_name == "transformer":
+        train_block_size = min(train_block_size, Config.TRANSFORMER_TRAIN_BLOCK_SIZE)
+        eval_batch_size = min(eval_batch_size, Config.TRANSFORMER_EVAL_BATCH_SIZE)
 
     for epoch in range(Config.EPOCHS):
         model.train()

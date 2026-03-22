@@ -36,7 +36,7 @@
                         {% for model in models.models %}
                         <div class="model-card" data-model-id="{{ model.id }}">
                             <div class="model-icon">
-                                <i class="fas fa-{{ 'layer-group' if model.type == 'cnn_lstm' else 'stream' if model.type == 'lstm' else 'bolt' }}"></i>
+                                <i class="fas fa-{{ model.icon or ('layer-group' if model.type in ['cnn_lstm', 'hybrid'] else 'stream' if model.type == 'lstm' else 'bolt') }}"></i>
                             </div>
                             <h3>{{ model.name }}</h3>
                             <p class="model-desc">{{ model.description }}</p>

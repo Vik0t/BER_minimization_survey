@@ -26,7 +26,8 @@ function selectModel(modelId) {
     fetch('/api/models')
         .then(response => response.json())
         .then(data => {
-            const model = data.models.find(m => m.id === modelId);
+            const modelList = data.models.models || data.models;
+            const model = modelList.find(m => m.id === modelId);
             if (model) {
                 document.getElementById('selectedModelInfo').style.display = 'block';
                 document.getElementById('selectedModelDetails').innerHTML = `

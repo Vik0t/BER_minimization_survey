@@ -201,7 +201,8 @@ def run_inference():
                 model_id=model_id,
                 input_file=filepath,
                 session_id=session_id,
-                result_id=result_id
+                result_id=result_id,
+                batch_size=int(data.get("batch_size", 256))
             )
             
             # Сохраняем результат
