@@ -47,6 +47,10 @@ class Config:
     COMPLEX_USE_KERR = False
     COMPLEX_KERR_KERNEL = 5
     COMPLEX_KERR_INIT_GAMMA = 0.02
+    DBP_NUM_STEPS = 8
+    DBP_KERNEL_SIZE = 7
+    DBP_USE_SYMMETRIC_FILTER = True
+    DBP_SEQSTAT_DIM = 128
 
     EPOCHS = 250
     LEARNING_RATE = 1e-3
@@ -68,7 +72,7 @@ class Config:
     TEST_BER_EVERY = 5
 
     OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["complex_lstm", "complex_cnn_lstm", "complex_cnn"]
+    MODEL_TYPES = ["complex_lstm", "complex_dbp_seqstat", "complex_cnn_lstm", "complex_cnn"]
     SAVE_BEST = True
     RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
@@ -266,9 +270,11 @@ class HybridCNNLSTMEqualizer(nn.Module):
 
 
 class ComplexConv1d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, groups: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, groups: int = 1, symmetric: bool = False):
         super().__init__()
-        padding = kernel_size // 2
+        self.symmetric = symmetric
+        effective_kernel = 2 * kernel_size - 1 if symmetric else kernel_size
+        padding = effective_kernel // 2
         self.real_conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -291,11 +297,22 @@ class ComplexConv1d(nn.Module):
         nn.init.kaiming_normal_(self.real_conv.weight, nonlinearity="linear")
         nn.init.kaiming_normal_(self.imag_conv.weight, nonlinearity="linear")
 
+    def _build_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if not self.symmetric:
+            return weight
+        return torch.cat([weight, weight.flip(dims=(2,))[:, :, 1:]], dim=2)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         real = x[:, 0::2, :]
         imag = x[:, 1::2, :]
-        out_real = self.real_conv(real) - self.imag_conv(imag)
-        out_imag = self.imag_conv(real) + self.real_conv(imag)
+        real_weight = self._build_weight(self.real_conv.weight)
+        imag_weight = self._build_weight(self.imag_conv.weight)
+        out_real = F.conv1d(real, real_weight, padding=self.real_conv.padding[0], groups=self.real_conv.groups) - F.conv1d(
+            imag, imag_weight, padding=self.imag_conv.padding[0], groups=self.imag_conv.groups
+        )
+        out_imag = F.conv1d(real, imag_weight, padding=self.imag_conv.padding[0], groups=self.imag_conv.groups) + F.conv1d(
+            imag, real_weight, padding=self.real_conv.padding[0], groups=self.real_conv.groups
+        )
         return torch.stack((out_real, out_imag), dim=2).flatten(1, 2)
 
 
@@ -424,6 +441,72 @@ class ComplexFeatureEncoder(nn.Module):
         return raw, x, seq_features
 
 
+class ComplexDBPStep1Ch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = ComplexConv1d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=Config.DBP_KERNEL_SIZE,
+            symmetric=Config.DBP_USE_SYMMETRIC_FILTER,
+        )
+        self.nonlinear = KerrLikeActivation(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.nonlinear(self.linear(x))
+
+
+class ComplexDBPSeqStatRxEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.steps = nn.ModuleList([ComplexDBPStep1Ch() for _ in range(Config.DBP_NUM_STEPS)])
+        feature_dim = 3 * (Config.DBP_NUM_STEPS + 1)
+        fused_dim = feature_dim * 3 + Config.INPUT_DIM
+        self.head = nn.Sequential(
+            nn.Linear(fused_dim, Config.DBP_SEQSTAT_DIM),
+            nn.LayerNorm(Config.DBP_SEQSTAT_DIM),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.DBP_SEQSTAT_DIM, Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.5),
+            nn.Linear(Config.HIDDEN_DIM, 2),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+
+    @staticmethod
+    def _seq_features(x: torch.Tensor) -> torch.Tensor:
+        real = x[:, 0:1, :]
+        imag = x[:, 1:2, :]
+        magnitude = torch.sqrt(real.square() + imag.square() + 1e-6)
+        return torch.cat([real, imag, magnitude], dim=1).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        state = raw.transpose(1, 2)
+        features = [self._seq_features(state)]
+        for step in self.steps:
+            state = step(state)
+            features.append(self._seq_features(state))
+        seq = torch.cat(features, dim=2)
+        center = seq[:, Config.CONTEXT_K, :]
+        mean = seq.mean(dim=1)
+        std = seq.std(dim=1, unbiased=False)
+        fused = torch.cat([center, mean, std, raw[:, Config.CONTEXT_K, :]], dim=1)
+        return self.head(fused)
+
+
 class ComplexCNNRxEqualizer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -502,7 +585,7 @@ class ComplexLSTMRxEqualizer(nn.Module):
         lstm_out_dim = Config.COMPLEX_LSTM_HIDDEN * (2 if Config.BIDIRECTIONAL else 1)
         self.attention = AttentionLayer(lstm_out_dim)
         self.center_fusion = nn.Sequential(
-            nn.Linear(lstm_out_dim * 2 + 2 * Config.INPUT_DIM, Config.COMPLEX_HEAD_DIM),
+            nn.Linear(lstm_out_dim * 2 + Config.INPUT_DIM, Config.COMPLEX_HEAD_DIM),
             nn.LayerNorm(Config.COMPLEX_HEAD_DIM),
             nn.GELU(),
         )
@@ -569,7 +652,7 @@ class ComplexCNNLSTMRxEqualizer(nn.Module):
         lstm_out_dim = Config.COMPLEX_LSTM_HIDDEN * (2 if Config.BIDIRECTIONAL else 1)
         self.attention = AttentionLayer(lstm_out_dim)
         self.center_fusion = nn.Sequential(
-            nn.Linear(lstm_out_dim * 2 + 2 * Config.INPUT_DIM, Config.COMPLEX_HEAD_DIM),
+            nn.Linear(lstm_out_dim * 2 + Config.INPUT_DIM, Config.COMPLEX_HEAD_DIM),
             nn.LayerNorm(Config.COMPLEX_HEAD_DIM),
             nn.GELU(),
         )
@@ -903,6 +986,8 @@ def make_model(name: str) -> nn.Module:
         return HybridCNNLSTMEqualizer().to(Config.DEVICE)
     if name == "complex_lstm":
         return ComplexLSTMRxEqualizer().to(Config.DEVICE)
+    if name == "complex_dbp_seqstat":
+        return ComplexDBPSeqStatRxEqualizer().to(Config.DEVICE)
     if name == "complex_cnn_lstm":
         return ComplexCNNLSTMRxEqualizer().to(Config.DEVICE)
     if name == "complex_cnn":
