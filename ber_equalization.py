@@ -47,9 +47,13 @@ class Config:
     COMPLEX_USE_KERR = False
     COMPLEX_KERR_KERNEL = 5
     COMPLEX_KERR_INIT_GAMMA = 0.02
-    DBP_NUM_STEPS = 8
-    DBP_KERNEL_SIZE = 7
+    DBP_NUM_STEPS = 3
+    DBP_KERNEL_SIZE = 5
     DBP_USE_SYMMETRIC_FILTER = True
+    DBP_USE_SYMMETRIC_NONLINEAR = True
+    DBP_NL_MEMORY = 1
+    DBP_INIT_FROM_LS = True
+    DBP_INIT_SAMPLES = 65536
     DBP_SEQSTAT_DIM = 128
 
     EPOCHS = 250
@@ -344,9 +348,10 @@ class ComplexResidualBlock(nn.Module):
 
 
 class KerrLikeActivation(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, kernel_size: Optional[int] = None, init_gamma: Optional[float] = None, symmetric: bool = False):
         super().__init__()
-        kernel_size = Config.COMPLEX_KERR_KERNEL
+        kernel_size = Config.COMPLEX_KERR_KERNEL if kernel_size is None else kernel_size
+        self.symmetric = symmetric
         self.power_filter = nn.Conv1d(
             channels,
             channels,
@@ -355,7 +360,8 @@ class KerrLikeActivation(nn.Module):
             groups=channels,
             bias=False,
         )
-        self.gamma = nn.Parameter(torch.full((1, channels, 1), Config.COMPLEX_KERR_INIT_GAMMA))
+        gamma = Config.COMPLEX_KERR_INIT_GAMMA if init_gamma is None else init_gamma
+        self.gamma = nn.Parameter(torch.full((1, channels, 1), gamma))
         self._init_weights()
 
     def _init_weights(self):
@@ -363,10 +369,22 @@ class KerrLikeActivation(nn.Module):
         center = self.power_filter.weight.size(-1) // 2
         self.power_filter.weight.data[:, :, center] = 1.0
 
+    def _build_weight(self) -> torch.Tensor:
+        weight = self.power_filter.weight
+        if not self.symmetric:
+            return weight
+        return torch.cat([weight, weight.flip(dims=(2,))[:, :, 1:]], dim=2)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         real = x[:, 0::2, :]
         imag = x[:, 1::2, :]
-        power = self.power_filter(real.square() + imag.square())
+        power_weight = self._build_weight()
+        power = F.conv1d(
+            real.square() + imag.square(),
+            power_weight,
+            padding=power_weight.size(-1) // 2,
+            groups=self.power_filter.groups,
+        )
         phase = self.gamma * power
         cos_phase = torch.cos(phase)
         sin_phase = torch.sin(phase)
@@ -450,7 +468,13 @@ class ComplexDBPStep1Ch(nn.Module):
             kernel_size=Config.DBP_KERNEL_SIZE,
             symmetric=Config.DBP_USE_SYMMETRIC_FILTER,
         )
-        self.nonlinear = KerrLikeActivation(1)
+        nl_kernel = Config.DBP_NL_MEMORY + 1 if Config.DBP_USE_SYMMETRIC_NONLINEAR else 2 * Config.DBP_NL_MEMORY + 1
+        self.nonlinear = KerrLikeActivation(
+            1,
+            kernel_size=nl_kernel,
+            init_gamma=Config.COMPLEX_KERR_INIT_GAMMA,
+            symmetric=Config.DBP_USE_SYMMETRIC_NONLINEAR,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.nonlinear(self.linear(x))
@@ -460,6 +484,14 @@ class ComplexDBPSeqStatRxEqualizer(nn.Module):
     def __init__(self):
         super().__init__()
         self.steps = nn.ModuleList([ComplexDBPStep1Ch() for _ in range(Config.DBP_NUM_STEPS)])
+        linear_delay = Config.DBP_KERNEL_SIZE - 1 if Config.DBP_USE_SYMMETRIC_FILTER else Config.DBP_KERNEL_SIZE // 2
+        nl_delay = Config.DBP_NL_MEMORY if Config.DBP_USE_SYMMETRIC_NONLINEAR else 2 * Config.DBP_NL_MEMORY
+        self.valid_margin = Config.DBP_NUM_STEPS * (linear_delay + nl_delay)
+        if self.valid_margin > Config.CONTEXT_K:
+            raise ValueError(
+                f"DBP receptive radius {self.valid_margin} exceeds CONTEXT_K={Config.CONTEXT_K}. "
+                "Reduce DBP_NUM_STEPS, DBP_KERNEL_SIZE, or DBP_NL_MEMORY."
+            )
         feature_dim = 3 * (Config.DBP_NUM_STEPS + 1)
         fused_dim = feature_dim * 3 + Config.INPUT_DIM
         self.head = nn.Sequential(
@@ -492,6 +524,44 @@ class ComplexDBPSeqStatRxEqualizer(nn.Module):
         magnitude = torch.sqrt(real.square() + imag.square() + 1e-6)
         return torch.cat([real, imag, magnitude], dim=1).transpose(1, 2)
 
+    @torch.no_grad()
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
+        if not Config.DBP_INIT_FROM_LS:
+            return
+        samples = min(train_x.size(0), Config.DBP_INIT_SAMPLES)
+        if samples < Config.SEQ_LEN:
+            return
+
+        windows = train_x[:samples].view(samples, Config.SEQ_LEN, Config.INPUT_DIM)
+        target = train_y[:samples]
+        rx_complex = torch.complex(windows[:, :, 0], windows[:, :, 1]).to(torch.complex64)
+        tx_complex = torch.complex(target[:, 0], target[:, 1]).to(torch.complex64)
+
+        solution = torch.linalg.lstsq(rx_complex, tx_complex.unsqueeze(1)).solution.squeeze(1)
+        solution = solution / solution.norm().clamp_min(1e-6)
+
+        if Config.DBP_USE_SYMMETRIC_FILTER:
+            center = Config.CONTEXT_K
+            half = solution[center:].clone()
+            half[1:] = 0.5 * (half[1:] + solution[:center].flip(0).conj())
+            init_kernel = half[: Config.DBP_KERNEL_SIZE]
+        else:
+            start = max(0, Config.CONTEXT_K - Config.DBP_KERNEL_SIZE // 2)
+            init_kernel = solution[start : start + Config.DBP_KERNEL_SIZE]
+
+        first_step = self.steps[0].linear
+        first_step.real_conv.weight.copy_(init_kernel.real.view(1, 1, -1).to(first_step.real_conv.weight.dtype))
+        first_step.imag_conv.weight.copy_(init_kernel.imag.view(1, 1, -1).to(first_step.imag_conv.weight.dtype))
+
+        for step in self.steps[1:]:
+            step.linear.real_conv.weight.zero_()
+            step.linear.imag_conv.weight.zero_()
+            identity_idx = step.linear.real_conv.weight.size(-1) - 1 if step.linear.symmetric else step.linear.real_conv.weight.size(-1) // 2
+            step.linear.real_conv.weight[:, :, identity_idx] = 1.0
+            center = step.nonlinear.power_filter.weight.size(-1) // 2
+            step.nonlinear.power_filter.weight.zero_()
+            step.nonlinear.power_filter.weight[:, :, center] = 1.0
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
         state = raw.transpose(1, 2)
@@ -501,8 +571,12 @@ class ComplexDBPSeqStatRxEqualizer(nn.Module):
             features.append(self._seq_features(state))
         seq = torch.cat(features, dim=2)
         center = seq[:, Config.CONTEXT_K, :]
-        mean = seq.mean(dim=1)
-        std = seq.std(dim=1, unbiased=False)
+        if self.valid_margin > 0:
+            valid_seq = seq[:, self.valid_margin : Config.SEQ_LEN - self.valid_margin, :]
+        else:
+            valid_seq = seq
+        mean = valid_seq.mean(dim=1)
+        std = valid_seq.std(dim=1, unbiased=False)
         fused = torch.cat([center, mean, std, raw[:, Config.CONTEXT_K, :]], dim=1)
         return self.head(fused)
 
@@ -1285,6 +1359,9 @@ def run_sweep_experiments():
 
 def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
     model = make_model(model_name)
+    if hasattr(model, "initialize_from_data"):
+        model.initialize_from_data(data["train_x"], data["train_y"])
+        log(f"{model_name} | initialized from training windows")
     if Config.USE_TORCH_COMPILE and hasattr(torch, "compile"):
         try:
             model = torch.compile(model, mode=Config.TORCH_COMPILE_MODE)
