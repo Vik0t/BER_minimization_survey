@@ -1,3 +1,6 @@
+"""Structured BER equalization training with DBP-inspired complex models."""
+
+import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -17,10 +20,10 @@ class Config:
         "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     )
     DATA_DIR_CANDIDATES = [Path("symbols_new"), Path("Symbols_1m_1ch_PR"), Path(".")]
-    MAX_FILES = 64
-    TRAIN_PORTION = 0.98
+    MAX_FILES = 32
+    TRAIN_PORTION = 0.8
 
-    CONTEXT_K = 32
+    CONTEXT_K = 192
     SEQ_LEN = 2 * CONTEXT_K + 1
     INPUT_DIM = 2
 
@@ -45,7 +48,7 @@ class Config:
     COMPLEX_LSTM_HIDDEN = 64
     COMPLEX_LSTM_LAYERS = 2
     COMPLEX_USE_KERR = False
-    COMPLEX_USE_DBP_FRONTEND = False
+    COMPLEX_USE_DBP_FRONTEND = True
     COMPLEX_KERR_KERNEL = 5
     COMPLEX_KERR_INIT_GAMMA = 0.02
     DBP_NUM_STEPS = 20
@@ -54,38 +57,57 @@ class Config:
     DBP_USE_FINAL_FILTER = True
     DBP_USE_SYMMETRIC_FILTER = True
     DBP_USE_SYMMETRIC_NONLINEAR = True
+    DBP_MANUAL_SHIFT = True
     DBP_NL_MEMORY = 2
-    DBP_INIT_FROM_LS = False
+    DBP_INIT_FROM_LS = True
     DBP_INIT_SAMPLES = 65536
     DBP_INIT_FFT_SIZE = 4096
     DBP_JOINT_INIT = True
-    DBP_JOINT_INIT_ITERS = 200
+    DBP_JOINT_INIT_ITERS = 80
     DBP_JOINT_INIT_BATCH_SIZE = 1024
     DBP_JOINT_INIT_LR = 2e-3
+    DBP_SEQUENCE_JOINT_PRETRAIN = True
+    DBP_SEQUENCE_JOINT_EPOCHS = 16
+    DBP_SEQUENCE_JOINT_LR = 1e-3
+    DBP_SEQUENCE_JOINT_CHUNK_LEN = 8192
+    DBP_SEQUENCE_JOINT_BATCH_SIZE = 8
+    DBP_SEQUENCE_JOINT_DECAY_STEPS = 4
+    DBP_SEQUENCE_JOINT_MIN_LR = 1e-5
+    DBP_USE_CDC_PRETRAIN = True
+    DBP_CDC_PRETRAIN_EPOCHS = 24
+    DBP_CDC_PRETRAIN_LR = 1e-3
+    DBP_CDC_PRETRAIN_CHUNK_LEN = 8192
+    DBP_CDC_PRETRAIN_BATCH_SIZE = 8
+    DBP_CDC_PRETRAIN_DECAY_STEPS = 5
+    DBP_CDC_PRETRAIN_MIN_LR = 1e-5
+    NOTEBOOK_FRONTEND_PRETRAIN = False
+    FRONTEND_PRETRAIN_CHUNK_LEN = 4096
+    FRONTEND_PRETRAIN_BATCH_SIZE = 8
+    FRONTEND_PRETRAIN_EPOCHS = 12
+    FRONTEND_PRETRAIN_LR = 1e-3
+    FRONTEND_PRETRAIN_DECAY_STEPS = 4
+    FRONTEND_PRETRAIN_MIN_LR = 1e-5
     DBP_SEQSTAT_DIM = 128
 
-    EPOCHS = 160
+    EPOCHS = 120
     LEARNING_RATE = 1e-3
-    WEIGHT_DECAY = 1e-5
+    WEIGHT_DECAY = 0.0
     TRAIN_BLOCK_SIZE = 16384
     EVAL_BATCH_SIZE = 65536
     MIN_BLOCK_SIZE = 1024
     USE_AMP = True
     USE_TORCH_COMPILE = False
     TORCH_COMPILE_MODE = "max-autotune-no-cudagraphs"
-    OPTIMIZER = "adamw"
-    LOSS = "smooth_l1"
-    GRAD_CLIP_NORM = 1.0
     LR_SCHEDULER = "notebook_decay"
     SCHEDULER_FACTOR = 0.5
     SCHEDULER_PATIENCE = 100
     SCHEDULER_THRESHOLD = 1e-6
 
-    DECAY_STEPS = 8
+    DECAY_STEPS = 40
     MIN_LR = 1e-5
     LOG_EVERY = 1
     TEST_BER_EVERY = 10
-    SAVE_BEST_BY = "val_ber"
+    SAVE_BEST_BY = "val_loss"
     POWER_NORMALIZE = True
     BER_SCALE_SEARCH = True
     BER_SCALE_MIN = 0.5
@@ -94,13 +116,46 @@ class Config:
     BER_SCALE_OFFSET = 10000
     BER_SCALE_SAMPLES = 1 << 20
 
-    OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["lstm", "cnn_lstm", "complex_lstm", "complex_cnn_lstm"]
+    OUT_DIR = Path("complex_compare_outputs")
+    MODEL_TYPES = ["complex_dbp_seqstat", "complex_lstm", "complex_cnn_lstm", "complex_cnn"]
     SAVE_BEST = True
     RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
     WINDOW_SWEEP_VALUES = [2, 4, 8, 12, 16, 20]
     HIDDEN_SWEEP_VALUES = [8, 16, 32, 64]
+
+    SYMBOL_RATE = 32.0e9
+    NUMBER_OF_SPANS = 20
+    SPAN_LENGTH = 100e3
+    D_CD = 17e-6
+    LAMBDA = 1.55e-6
+    LIGHT_SPEED = 299792458.0
+    CHANNEL_FREQUENCY = 0.0
+
+
+def apply_runtime_profile():
+    if Config.DEVICE.type != "cuda":
+        return
+    device_name = torch.cuda.get_device_name(0).upper()
+    if "V100" not in device_name:
+        return
+
+    # One-V100 profile: keep the notebook-style stages, but trim the most
+    # expensive sequence pretraining loops so a single GPU can train in a
+    # practical amount of time.
+    Config.TRAIN_BLOCK_SIZE = 16384
+    Config.EVAL_BATCH_SIZE = 65536
+    Config.EPOCHS = min(Config.EPOCHS, 120)
+    Config.TEST_BER_EVERY = max(Config.TEST_BER_EVERY, 10)
+    Config.DECAY_STEPS = min(Config.DECAY_STEPS, 40)
+    Config.DBP_JOINT_INIT_ITERS = min(Config.DBP_JOINT_INIT_ITERS, 80)
+    Config.DBP_CDC_PRETRAIN_EPOCHS = min(Config.DBP_CDC_PRETRAIN_EPOCHS, 24)
+    Config.DBP_SEQUENCE_JOINT_EPOCHS = min(Config.DBP_SEQUENCE_JOINT_EPOCHS, 16)
+    Config.FRONTEND_PRETRAIN_EPOCHS = min(Config.FRONTEND_PRETRAIN_EPOCHS, 12)
+    Config.NOTEBOOK_FRONTEND_PRETRAIN = False
+
+
+apply_runtime_profile()
 
 
 if Config.DEVICE.type == "cuda":
@@ -465,9 +520,9 @@ class ComplexFeatureEncoder(nn.Module):
         self.final_norm = nn.BatchNorm1d(2 * in_channels)
         self.out_channels = in_channels
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor, data: Optional[Dict[str, torch.Tensor]] = None):
         if self.dbp_frontend is not None:
-            self.dbp_frontend.initialize_from_data(train_x, train_y)
+            self.dbp_frontend.initialize_from_data(train_x, train_y, data=data)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
@@ -510,6 +565,7 @@ class ComplexDBPStep1Ch(nn.Module):
 class ComplexDBPFrontEnd(nn.Module):
     def __init__(self):
         super().__init__()
+        self.step_meta = get_dbp_step_metadata()
         self.steps = nn.ModuleList([ComplexDBPStep1Ch() for _ in range(Config.DBP_NUM_STEPS)])
         self.final_linear = (
             ComplexConv1d(
@@ -530,7 +586,11 @@ class ComplexDBPFrontEnd(nn.Module):
                 else Config.DBP_FINAL_KERNEL_SIZE // 2
             )
         nl_delay = Config.DBP_NL_MEMORY if Config.DBP_USE_SYMMETRIC_NONLINEAR else 2 * Config.DBP_NL_MEMORY
-        self.valid_margin = Config.DBP_NUM_STEPS * (linear_delay + nl_delay) + final_delay
+        self.filter_delay = Config.DBP_NUM_STEPS * (linear_delay + nl_delay) + final_delay
+        self.full_delay = self.filter_delay
+        if Config.DBP_MANUAL_SHIFT:
+            self.full_delay += self.step_meta["max_full_shift"]
+        self.valid_margin = self.full_delay
         if self.valid_margin > Config.CONTEXT_K:
             raise ValueError(
                 f"DBP receptive radius {self.valid_margin} exceeds CONTEXT_K={Config.CONTEXT_K}. "
@@ -543,6 +603,19 @@ class ComplexDBPFrontEnd(nn.Module):
         imag = x[:, 1:2, :]
         magnitude = torch.sqrt(real.square() + imag.square() + 1e-6)
         return torch.cat([real, imag, magnitude], dim=1).transpose(1, 2)
+
+    def full_crop_bounds(self) -> Tuple[int, int]:
+        return (
+            self.filter_delay + self.step_meta["full_output_shifts"][0],
+            self.filter_delay + self.step_meta["full_output_shifts"][1],
+        )
+
+    def step_crop_bounds(self) -> Tuple[int, int]:
+        delay = Config.DBP_KERNEL_SIZE - 1 if Config.DBP_USE_SYMMETRIC_FILTER else Config.DBP_KERNEL_SIZE // 2
+        return (
+            delay + self.step_meta["step_output_shifts"][0],
+            delay + self.step_meta["step_output_shifts"][1],
+        )
 
     def forward(
         self,
@@ -602,10 +675,253 @@ class ComplexDBPFrontEnd(nn.Module):
             )
             assign_complex_kernel(self.final_linear, final_kernel)
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
+    def _cdc_targets(self, rx_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        chunk_len = rx_batch.size(1)
+        delay = Config.DBP_KERNEL_SIZE - 1 if Config.DBP_USE_SYMMETRIC_FILTER else Config.DBP_KERNEL_SIZE // 2
+        step_length = self.step_meta["step_length"]
+        step_targets: List[torch.Tensor] = []
+        rx_complex = torch.complex(rx_batch[:, :, 0], rx_batch[:, :, 1]).to(torch.complex64)
+        for sample in rx_complex:
+            compensated = cd_operator(sample, step_length, direction="b")
+            crop_left, crop_right = self.step_crop_bounds()
+            step_targets.append(torch.view_as_real(compensated)[crop_left : chunk_len - crop_right])
+        step_target = torch.stack(step_targets, dim=0).permute(0, 2, 1).contiguous()
+
+        full_targets: List[torch.Tensor] = []
+        full_delay_left, full_delay_right = self.full_crop_bounds()
+        for sample in rx_complex:
+            compensated = cd_operator(sample, fiber_length(), direction="b")
+            full_targets.append(torch.view_as_real(compensated)[full_delay_left : chunk_len - full_delay_right])
+        full_target = torch.stack(full_targets, dim=0).permute(0, 2, 1).contiguous()
+        return step_target, full_target
+
+    def _sequence_targets(self, rx_batch: torch.Tensor) -> List[torch.Tensor]:
+        chunk_len = rx_batch.size(1)
+        rx_complex = torch.complex(rx_batch[:, :, 0], rx_batch[:, :, 1]).to(torch.complex64)
+        targets_per_stage: List[List[torch.Tensor]] = []
+        stage_lengths = [self.step_meta["step_length"] * (idx + 1) for idx in range(Config.DBP_NUM_STEPS)]
+        if self.final_linear is not None:
+            stage_lengths.append(fiber_length())
+
+        full_left, full_right = self.full_crop_bounds()
+        for _ in stage_lengths:
+            targets_per_stage.append([])
+
+        for sample in rx_complex:
+            for stage_idx, length in enumerate(stage_lengths):
+                compensated = cd_operator(sample, length, direction="b")
+                cropped = torch.view_as_real(compensated)[full_left : chunk_len - full_right]
+                targets_per_stage[stage_idx].append(cropped)
+
+        return [
+            torch.stack(stage_targets, dim=0).permute(0, 2, 1).contiguous()
+            for stage_targets in targets_per_stage
+        ]
+
+    def _sequence_joint_pretrain(self, data: Optional[Dict[str, torch.Tensor]], model_name: str = "dbp"):
+        if not Config.DBP_SEQUENCE_JOINT_PRETRAIN or data is None:
+            return
+        train_rx = data["rx_train_raw"]
+        val_rx = data["rx_val_raw"]
+        chunk_len = min(Config.DBP_SEQUENCE_JOINT_CHUNK_LEN, train_rx.size(0), val_rx.size(0))
+        if chunk_len <= 2 * self.full_delay + 1:
+            log(f"{model_name} | skip sequence joint pretrain: chunk too short for full delay {self.full_delay}")
+            return
+
+        optimizer = optim.Adam(self.parameters(), lr=Config.DBP_SEQUENCE_JOINT_LR)
+        criterion = nn.MSELoss()
+        best_state = None
+        best_val = float("inf")
+        steps_wo_min = 0
+        train_steps = max(1, min(train_rx.size(0) // chunk_len, 12))
+        val_steps = max(1, min(val_rx.size(0) // chunk_len, 4))
+        full_left, full_right = self.full_crop_bounds()
+
+        for epoch in range(Config.DBP_SEQUENCE_JOINT_EPOCHS):
+            self.train()
+            train_loss_sum = 0.0
+            train_count = 0
+            for rx_chunk, _ in iter_sequence_chunks(
+                train_rx,
+                train_rx,
+                chunk_len=chunk_len,
+                batch_size=Config.DBP_SEQUENCE_JOINT_BATCH_SIZE,
+                steps_per_epoch=train_steps,
+            ):
+                xb = rx_chunk.to(Config.DEVICE)
+                targets = [t.to(Config.DEVICE) for t in self._sequence_targets(xb.cpu())]
+                optimizer.zero_grad(set_to_none=True)
+                _, states = self.forward(xb.view(xb.size(0), -1), collect_states=True)
+                comparable_states = states[1:]
+                losses = [
+                    criterion(state[:, :, full_left : chunk_len - full_right], target)
+                    for state, target in zip(comparable_states, targets)
+                ]
+                loss = torch.stack(losses).mean()
+                loss.backward()
+                optimizer.step()
+                train_loss_sum += loss.item()
+                train_count += 1
+
+            self.eval()
+            val_loss_sum = 0.0
+            with torch.inference_mode():
+                for rx_chunk, _ in iter_sequence_chunks(
+                    val_rx,
+                    val_rx,
+                    chunk_len=chunk_len,
+                    batch_size=Config.DBP_SEQUENCE_JOINT_BATCH_SIZE,
+                    steps_per_epoch=val_steps,
+                ):
+                    xb = rx_chunk.to(Config.DEVICE)
+                    targets = [t.to(Config.DEVICE) for t in self._sequence_targets(xb.cpu())]
+                    _, states = self.forward(xb.view(xb.size(0), -1), collect_states=True)
+                    comparable_states = states[1:]
+                    losses = [
+                        criterion(state[:, :, full_left : chunk_len - full_right], target)
+                        for state, target in zip(comparable_states, targets)
+                    ]
+                    val_loss_sum += torch.stack(losses).mean().item()
+
+            train_loss = train_loss_sum / max(train_count, 1)
+            val_loss = val_loss_sum / max(val_steps, 1)
+            if val_loss + Config.SCHEDULER_THRESHOLD < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+                steps_wo_min = 0
+            else:
+                steps_wo_min += 1
+
+            if steps_wo_min >= Config.DBP_SEQUENCE_JOINT_DECAY_STEPS:
+                steps_wo_min = 0
+                current_lr = optimizer.param_groups[0]["lr"]
+                new_lr = current_lr * Config.SCHEDULER_FACTOR
+                if new_lr < Config.DBP_SEQUENCE_JOINT_MIN_LR:
+                    log(f"{model_name} | sequence joint pretrain stop at lr floor ({current_lr:.6g})")
+                    break
+                for group in optimizer.param_groups:
+                    group["lr"] = new_lr
+                log(f"{model_name} | sequence joint pretrain lr -> {new_lr:.6g}")
+
+            log(
+                f"{model_name} | sequence joint pretrain {epoch+1:3d}/{Config.DBP_SEQUENCE_JOINT_EPOCHS} | "
+                f"train {train_loss:.6f} | val {val_loss:.6f} | lr {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+
+    def _cdc_pretrain(self, data: Optional[Dict[str, torch.Tensor]], model_name: str = "dbp"):
+        if not Config.DBP_USE_CDC_PRETRAIN or data is None:
+            return
+        train_rx = data["rx_train_raw"]
+        val_rx = data["rx_val_raw"]
+        chunk_len = min(Config.DBP_CDC_PRETRAIN_CHUNK_LEN, train_rx.size(0), val_rx.size(0))
+        if chunk_len <= 2 * self.valid_margin + 1:
+            log(f"{model_name} | skip CDC pretrain: chunk too short for valid margin {self.valid_margin}")
+            return
+
+        step_optimizer = optim.Adam(self.steps[0].linear.parameters(), lr=Config.DBP_CDC_PRETRAIN_LR)
+        full_params = list(self.parameters())
+        full_optimizer = optim.Adam(full_params, lr=Config.DBP_CDC_PRETRAIN_LR)
+        criterion = nn.MSELoss()
+        best_state = None
+        best_val = float("inf")
+        steps_wo_min = 0
+        train_steps = max(1, min(train_rx.size(0) // chunk_len, 16))
+        val_steps = max(1, min(val_rx.size(0) // chunk_len, 4))
+
+        for epoch in range(Config.DBP_CDC_PRETRAIN_EPOCHS):
+            self.train()
+            train_loss_sum = 0.0
+            count = 0
+            for rx_chunk, _ in iter_sequence_chunks(
+                train_rx,
+                train_rx,
+                chunk_len=chunk_len,
+                batch_size=Config.DBP_CDC_PRETRAIN_BATCH_SIZE,
+                steps_per_epoch=train_steps,
+            ):
+                xb = rx_chunk.to(Config.DEVICE)
+                step_target, full_target = self._cdc_targets(xb.cpu())
+                step_target = step_target.to(Config.DEVICE)
+                full_target = full_target.to(Config.DEVICE)
+
+                step_optimizer.zero_grad(set_to_none=True)
+                step_state = self.steps[0].linear(xb.transpose(1, 2))
+                step_left, step_right = self.step_crop_bounds()
+                step_loss = criterion(step_state[:, :, step_left : chunk_len - step_right], step_target)
+                step_loss.backward()
+                step_optimizer.step()
+
+                full_optimizer.zero_grad(set_to_none=True)
+                full_state, _ = self.forward(xb.view(xb.size(0), -1), collect_states=False)
+                full_left, full_right = self.full_crop_bounds()
+                full_loss = criterion(
+                    full_state[:, :, full_left : chunk_len - full_right],
+                    full_target,
+                )
+                full_loss.backward()
+                full_optimizer.step()
+                train_loss_sum += 0.5 * (step_loss.item() + full_loss.item())
+                count += 1
+
+            self.eval()
+            val_loss_sum = 0.0
+            with torch.inference_mode():
+                for rx_chunk, _ in iter_sequence_chunks(
+                    val_rx,
+                    val_rx,
+                    chunk_len=chunk_len,
+                    batch_size=Config.DBP_CDC_PRETRAIN_BATCH_SIZE,
+                    steps_per_epoch=val_steps,
+                ):
+                    xb = rx_chunk.to(Config.DEVICE)
+                    _, full_target = self._cdc_targets(xb.cpu())
+                    full_target = full_target.to(Config.DEVICE)
+                    full_state, _ = self.forward(xb.view(xb.size(0), -1), collect_states=False)
+                    full_left, full_right = self.full_crop_bounds()
+                    val_loss_sum += criterion(
+                        full_state[:, :, full_left : chunk_len - full_right],
+                        full_target,
+                    ).item()
+            train_loss = train_loss_sum / max(count, 1)
+            val_loss = val_loss_sum / max(val_steps, 1)
+            if val_loss + Config.SCHEDULER_THRESHOLD < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+                steps_wo_min = 0
+            else:
+                steps_wo_min += 1
+            if steps_wo_min >= Config.DBP_CDC_PRETRAIN_DECAY_STEPS:
+                steps_wo_min = 0
+                current_lr = full_optimizer.param_groups[0]["lr"]
+                new_lr = current_lr * Config.SCHEDULER_FACTOR
+                if new_lr < Config.DBP_CDC_PRETRAIN_MIN_LR:
+                    log(f"{model_name} | CDC pretrain stop at lr floor ({current_lr:.6g})")
+                    break
+                for optimizer in (step_optimizer, full_optimizer):
+                    for group in optimizer.param_groups:
+                        group["lr"] = new_lr
+                log(f"{model_name} | CDC pretrain lr -> {new_lr:.6g}")
+            log(
+                f"{model_name} | cdc pretrain {epoch+1:3d}/{Config.DBP_CDC_PRETRAIN_EPOCHS} | "
+                f"train {train_loss:.6f} | val {val_loss:.6f} | lr {full_optimizer.param_groups[0]['lr']:.2e}"
+            )
+        if best_state is not None:
+            self.load_state_dict(best_state)
+
+    def initialize_from_data(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        data: Optional[Dict[str, torch.Tensor]] = None,
+    ):
         if not Config.DBP_INIT_FROM_LS:
             return
         self._initialize_linear_kernels_from_ls(train_x, train_y)
+        self._cdc_pretrain(data)
+        self._sequence_joint_pretrain(data)
         if not Config.DBP_JOINT_INIT or Config.DBP_JOINT_INIT_ITERS <= 0:
             return
 
@@ -665,8 +981,8 @@ class ComplexDBPSeqStatRxEqualizer(nn.Module):
                 nn.init.constant_(module.weight, 1.0)
                 nn.init.constant_(module.bias, 0.0)
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
-        self.frontend.initialize_from_data(train_x, train_y)
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor, data: Optional[Dict[str, torch.Tensor]] = None):
+        self.frontend.initialize_from_data(train_x, train_y, data=data)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
@@ -709,8 +1025,8 @@ class ComplexCNNRxEqualizer(nn.Module):
         )
         self._init_weights()
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
-        self.encoder.initialize_from_data(train_x, train_y)
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor, data: Optional[Dict[str, torch.Tensor]] = None):
+        self.encoder.initialize_from_data(train_x, train_y, data=data)
 
     def _init_weights(self):
         for module in self.modules():
@@ -782,8 +1098,8 @@ class ComplexLSTMRxEqualizer(nn.Module):
         )
         self._init_weights()
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
-        self.encoder.initialize_from_data(train_x, train_y)
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor, data: Optional[Dict[str, torch.Tensor]] = None):
+        self.encoder.initialize_from_data(train_x, train_y, data=data)
 
     def _init_weights(self):
         for name, param in self.lstm.named_parameters():
@@ -852,8 +1168,8 @@ class ComplexCNNLSTMRxEqualizer(nn.Module):
         )
         self._init_weights()
 
-    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
-        self.encoder.initialize_from_data(train_x, train_y)
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor, data: Optional[Dict[str, torch.Tensor]] = None):
+        self.encoder.initialize_from_data(train_x, train_y, data=data)
 
     def _init_weights(self):
         for name, param in self.lstm.named_parameters():
@@ -1035,29 +1351,67 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-def build_criterion() -> nn.Module:
-    if Config.LOSS == "smooth_l1":
-        return nn.SmoothL1Loss(beta=0.05)
-    return nn.MSELoss()
-
-
-def build_optimizer(model: nn.Module) -> optim.Optimizer:
-    optimizer_kwargs = {"lr": Config.LEARNING_RATE, "weight_decay": Config.WEIGHT_DECAY}
-    if Config.DEVICE.type == "cuda":
-        optimizer_kwargs["fused"] = True
-    optimizer_name = Config.OPTIMIZER.lower()
-    optimizer_cls = optim.Adam if optimizer_name == "adam" else optim.AdamW
-    try:
-        return optimizer_cls(model.parameters(), **optimizer_kwargs)
-    except TypeError:
-        optimizer_kwargs.pop("fused", None)
-        return optimizer_cls(model.parameters(), **optimizer_kwargs)
-
-
 def complex_unit_response(response: torch.Tensor, order: int) -> torch.Tensor:
     magnitude = response.abs().clamp_min(1e-6).pow(1.0 / order)
     phase = torch.angle(response) / order
     return torch.polar(magnitude, phase)
+
+
+def fiber_length() -> float:
+    return Config.NUMBER_OF_SPANS * Config.SPAN_LENGTH
+
+
+def beta2_value() -> float:
+    return -(Config.LAMBDA**2) * Config.D_CD / (2 * math.pi * Config.LIGHT_SPEED)
+
+
+def get_dbp_step_metadata() -> Dict[str, object]:
+    step_length = fiber_length() / max(Config.DBP_NUM_STEPS, 1)
+    symbol_shift = int(step_length * 2 * math.pi * beta2_value() * Config.SYMBOL_RATE * Config.CHANNEL_FREQUENCY)
+    if symbol_shift == 0 or not Config.DBP_MANUAL_SHIFT:
+        last_step_length = 0.0
+        fd_step_length = 0.0
+        step_output_shifts = (0, 0)
+        full_output_shifts = (0, 0)
+        max_full_shift = 0
+    else:
+        shift_distance = abs(1.0 / (2 * math.pi * beta2_value() * Config.SYMBOL_RATE * Config.CHANNEL_FREQUENCY))
+        step_length = symbol_shift * shift_distance
+        residual_length = fiber_length() - step_length * Config.DBP_NUM_STEPS
+        last_symbol_shift = int(residual_length * 2 * math.pi * beta2_value() * Config.SYMBOL_RATE * Config.CHANNEL_FREQUENCY)
+        last_step_length = last_symbol_shift * shift_distance
+        fd_step_length = fiber_length() - step_length * Config.DBP_NUM_STEPS - last_step_length
+        step_output_shifts = (abs(min(symbol_shift, 0)), max(symbol_shift, 0))
+        full_output_shifts = (
+            Config.DBP_NUM_STEPS * step_output_shifts[0] + abs(min(last_symbol_shift, 0)),
+            Config.DBP_NUM_STEPS * step_output_shifts[1] + max(last_symbol_shift, 0),
+        )
+        max_full_shift = int(sum(full_output_shifts))
+    return {
+        "step_length": float(step_length),
+        "last_step_length": float(last_step_length),
+        "fd_step_length": float(fd_step_length),
+        "step_output_shifts": step_output_shifts,
+        "full_output_shifts": full_output_shifts,
+        "max_full_shift": max_full_shift,
+    }
+
+
+def cd_operator(signal: torch.Tensor, length: float, direction: str = "b") -> torch.Tensor:
+    if signal.ndim != 1:
+        raise ValueError("cd_operator expects a 1D complex tensor.")
+    size = signal.numel()
+    if size == 0:
+        return signal
+    device = signal.device
+    dtype = signal.dtype
+    dw = 2 * math.pi * Config.SYMBOL_RATE / size
+    w = torch.arange(-size / 2, size / 2, device=device, dtype=torch.float32) * dw
+    w = torch.fft.fftshift(w)
+    sign = -1.0 if direction == "b" else 1.0
+    phase = sign * 0.5j * beta2_value() * (w + 2 * math.pi * Config.CHANNEL_FREQUENCY) ** 2 * length
+    response = torch.exp(phase.to(torch.complex64 if dtype == torch.complex64 else torch.complex128))
+    return torch.fft.ifft(torch.fft.fft(signal) * response)
 
 
 def centered_complex_kernel_to_frequency(kernel: torch.Tensor, fft_size: int) -> torch.Tensor:
@@ -1152,6 +1506,132 @@ def power_normalize_pair(
     if rx_scale is None:
         rx_scale = compute_rms_scale(rx_symbols)
     return tx_symbols / tx_scale, rx_symbols / rx_scale, tx_scale, rx_scale
+
+
+def get_dbp_frontend(model: nn.Module) -> Optional[ComplexDBPFrontEnd]:
+    if hasattr(model, "frontend") and isinstance(model.frontend, ComplexDBPFrontEnd):
+        return model.frontend
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None and hasattr(encoder, "dbp_frontend") and isinstance(encoder.dbp_frontend, ComplexDBPFrontEnd):
+        return encoder.dbp_frontend
+    return None
+
+
+def iter_sequence_chunks(
+    rx_symbols: torch.Tensor,
+    tx_symbols: torch.Tensor,
+    chunk_len: int,
+    batch_size: int,
+    steps_per_epoch: int,
+):
+    total = min(rx_symbols.size(0), tx_symbols.size(0))
+    if total < chunk_len:
+        raise ValueError(f"Need at least {chunk_len} raw symbols for frontend pretraining, got {total}.")
+    max_start = total - chunk_len
+    for _ in range(steps_per_epoch):
+        starts = torch.randint(0, max_start + 1, (batch_size,))
+        rx_batch = torch.stack([rx_symbols[s : s + chunk_len] for s in starts.tolist()], dim=0)
+        tx_batch = torch.stack([tx_symbols[s : s + chunk_len] for s in starts.tolist()], dim=0)
+        yield rx_batch, tx_batch
+
+
+def pretrain_dbp_frontend(
+    model: nn.Module,
+    data: Dict[str, torch.Tensor],
+    model_name: str,
+):
+    if not Config.NOTEBOOK_FRONTEND_PRETRAIN:
+        return
+    frontend = get_dbp_frontend(model)
+    if frontend is None:
+        return
+
+    train_rx = data["rx_train_raw"]
+    train_tx = data["tx_train_raw"]
+    val_rx = data["rx_val_raw"]
+    val_tx = data["tx_val_raw"]
+    chunk_len = min(Config.FRONTEND_PRETRAIN_CHUNK_LEN, train_rx.size(0), val_rx.size(0))
+    if chunk_len <= 2 * frontend.valid_margin + 1:
+        log(f"{model_name} | skip frontend pretrain: chunk too short for valid margin {frontend.valid_margin}")
+        return
+
+    optimizer = optim.Adam(frontend.parameters(), lr=Config.FRONTEND_PRETRAIN_LR)
+    criterion = nn.MSELoss()
+    best_state = None
+    best_val = float("inf")
+    steps_without_improvement = 0
+    train_steps = max(1, min(train_rx.size(0) // chunk_len, 32))
+    val_steps = max(1, min(val_rx.size(0) // chunk_len, 8))
+    frontend.train()
+
+    for epoch in range(Config.FRONTEND_PRETRAIN_EPOCHS):
+        train_loss_sum = 0.0
+        train_count = 0
+        for rx_chunk, tx_chunk in iter_sequence_chunks(
+            train_rx,
+            train_tx,
+            chunk_len=chunk_len,
+            batch_size=Config.FRONTEND_PRETRAIN_BATCH_SIZE,
+            steps_per_epoch=train_steps,
+        ):
+            xb = rx_chunk.to(Config.DEVICE)
+            yb = tx_chunk.to(Config.DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            state, _ = frontend(xb.view(xb.size(0), -1), collect_states=False)
+            target = yb.transpose(1, 2)
+            valid = slice(frontend.valid_margin, chunk_len - frontend.valid_margin)
+            loss = criterion(state[:, :, valid], target[:, :, valid])
+            loss.backward()
+            optimizer.step()
+            train_loss_sum += loss.item()
+            train_count += 1
+
+        frontend.eval()
+        val_loss_sum = 0.0
+        with torch.inference_mode():
+            for rx_chunk, tx_chunk in iter_sequence_chunks(
+                val_rx,
+                val_tx,
+                chunk_len=chunk_len,
+                batch_size=Config.FRONTEND_PRETRAIN_BATCH_SIZE,
+                steps_per_epoch=val_steps,
+            ):
+                xb = rx_chunk.to(Config.DEVICE)
+                yb = tx_chunk.to(Config.DEVICE)
+                state, _ = frontend(xb.view(xb.size(0), -1), collect_states=False)
+                target = yb.transpose(1, 2)
+                valid = slice(frontend.valid_margin, chunk_len - frontend.valid_margin)
+                val_loss_sum += criterion(state[:, :, valid], target[:, :, valid]).item()
+        frontend.train()
+
+        train_loss = train_loss_sum / max(train_count, 1)
+        val_loss = val_loss_sum / max(val_steps, 1)
+        if val_loss + Config.SCHEDULER_THRESHOLD < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in frontend.state_dict().items()}
+            steps_without_improvement = 0
+        else:
+            steps_without_improvement += 1
+
+        if steps_without_improvement >= Config.FRONTEND_PRETRAIN_DECAY_STEPS:
+            steps_without_improvement = 0
+            current_lr = optimizer.param_groups[0]["lr"]
+            new_lr = current_lr * Config.SCHEDULER_FACTOR
+            if new_lr < Config.FRONTEND_PRETRAIN_MIN_LR:
+                log(f"{model_name} | frontend pretrain stop at lr floor ({current_lr:.6g})")
+                break
+            for group in optimizer.param_groups:
+                group["lr"] = new_lr
+            log(f"{model_name} | frontend pretrain lr -> {new_lr:.6g}")
+
+        log(
+            f"{model_name} | frontend pretrain {epoch+1:3d}/{Config.FRONTEND_PRETRAIN_EPOCHS} | "
+            f"train {train_loss:.6f} | val {val_loss:.6f} | lr {optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+    if best_state is not None:
+        frontend.load_state_dict(best_state)
+    frontend.eval()
 
 
 def find_best_symbol_scale(tx_symbols: torch.Tensor, rx_symbols: torch.Tensor) -> float:
@@ -1284,6 +1764,12 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         "val_y": val_y,
         "test_x": test_x,
         "test_y": test_y,
+        "tx_train_raw": tx_train,
+        "rx_train_raw": rx_train,
+        "tx_val_raw": tx_val,
+        "rx_val_raw": rx_val,
+        "tx_test_raw": tx_test,
+        "rx_test_raw": rx_test,
         "tx_test": tx_test,
         "rx_test": rx_test,
         "tx_test_center": tx_test_center,
@@ -1337,7 +1823,7 @@ def evaluate_split(
     scale_search: bool = False,
 ) -> Tuple[float, float, float, int, float]:
     model.eval()
-    criterion = build_criterion()
+    criterion = nn.MSELoss()
     bit_labels = BIT_LABELS.to(Config.DEVICE)
     current_batch_size = batch_size
 
@@ -1621,8 +2107,9 @@ def run_sweep_experiments():
 def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
     model = make_model(model_name)
     if hasattr(model, "initialize_from_data"):
-        model.initialize_from_data(data["train_x"], data["train_y"])
+        model.initialize_from_data(data["train_x"], data["train_y"], data=data)
         log(f"{model_name} | initialized from training windows")
+    pretrain_dbp_frontend(model, data, model_name)
     if Config.USE_TORCH_COMPILE and hasattr(torch, "compile"):
         try:
             model = torch.compile(model, mode=Config.TORCH_COMPILE_MODE)
@@ -1630,8 +2117,15 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         except Exception as exc:
             log(f"{model_name} | torch.compile disabled: {exc}")
 
-    optimizer = build_optimizer(model)
-    criterion = build_criterion()
+    optimizer_kwargs = {"lr": Config.LEARNING_RATE, "weight_decay": Config.WEIGHT_DECAY}
+    if Config.DEVICE.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    try:
+        optimizer = optim.Adam(model.parameters(), **optimizer_kwargs)
+    except TypeError:
+        optimizer_kwargs.pop("fused", None)
+        optimizer = optim.Adam(model.parameters(), **optimizer_kwargs)
+    criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler("cuda", enabled=Config.DEVICE.type == "cuda" and Config.USE_AMP)
     best_train_loss = float("inf")
     best_val_ber = float("inf")
@@ -1684,9 +2178,6 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
                         preds = model(xb)
                         loss = criterion(preds, yb)
                     scaler.scale(loss).backward()
-                    if Config.GRAD_CLIP_NORM > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRAD_CLIP_NORM)
                     scaler.step(optimizer)
                     scaler.update()
                     batch_size_now = yb.size(0)
