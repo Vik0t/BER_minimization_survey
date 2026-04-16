@@ -18,7 +18,7 @@ class Config:
     )
     DATA_DIR_CANDIDATES = [Path("symbols_new"), Path("Symbols_1m_1ch_PR"), Path(".")]
     MAX_FILES = 64
-    TRAIN_PORTION = 0.98
+    TRAIN_PORTION = 0.97
 
     CONTEXT_K = 32
     SEQ_LEN = 2 * CONTEXT_K + 1
@@ -66,26 +66,27 @@ class Config:
 
     EPOCHS = 160
     LEARNING_RATE = 1e-3
-    WEIGHT_DECAY = 1e-5
+    WEIGHT_DECAY = 0.0
     TRAIN_BLOCK_SIZE = 16384
     EVAL_BATCH_SIZE = 65536
     MIN_BLOCK_SIZE = 1024
     USE_AMP = True
     USE_TORCH_COMPILE = False
     TORCH_COMPILE_MODE = "max-autotune-no-cudagraphs"
-    OPTIMIZER = "adamw"
-    LOSS = "smooth_l1"
+    OPTIMIZER = "adam"
+    LOSS = "mse"
     GRAD_CLIP_NORM = 1.0
     LR_SCHEDULER = "notebook_decay"
     SCHEDULER_FACTOR = 0.5
     SCHEDULER_PATIENCE = 100
     SCHEDULER_THRESHOLD = 1e-6
 
-    DECAY_STEPS = 8
+    DECAY_STEPS = 24
     MIN_LR = 1e-5
     LOG_EVERY = 1
     TEST_BER_EVERY = 10
     SAVE_BEST_BY = "val_ber"
+    EVAL_ON_ALL_FILES = True
     POWER_NORMALIZE = True
     BER_SCALE_SEARCH = True
     BER_SCALE_MIN = 0.5
@@ -1258,11 +1259,13 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
     tx_train, rx_train = load_files(base_dir, train_idx)
     tx_val, rx_val = load_files(base_dir, val_idx)
     tx_test, rx_test = load_files(base_dir, test_idx)
+    tx_all, rx_all = load_files(base_dir, all_indices)
 
     if Config.POWER_NORMALIZE:
         tx_train, rx_train, tx_scale, rx_scale = power_normalize_pair(tx_train, rx_train)
         tx_val, rx_val, _, _ = power_normalize_pair(tx_val, rx_val, tx_scale=tx_scale, rx_scale=rx_scale)
         tx_test, rx_test, _, _ = power_normalize_pair(tx_test, rx_test, tx_scale=tx_scale, rx_scale=rx_scale)
+        tx_all, rx_all, _, _ = power_normalize_pair(tx_all, rx_all, tx_scale=tx_scale, rx_scale=rx_scale)
     else:
         tx_scale = torch.tensor(1.0, dtype=tx_train.dtype)
         rx_scale = torch.tensor(1.0, dtype=rx_train.dtype)
@@ -1274,8 +1277,11 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
     train_x, train_y = make_windows(rx_train, tx_train, mean, std)
     val_x, val_y = make_windows(rx_val, tx_val, mean, std)
     test_x, test_y = make_windows(rx_test, tx_test, mean, std)
+    all_x, all_y = make_windows(rx_all, tx_all, mean, std)
     rx_test_center = rx_test[Config.CONTEXT_K : rx_test.size(0) - Config.CONTEXT_K].contiguous()
     tx_test_center = tx_test[Config.CONTEXT_K : tx_test.size(0) - Config.CONTEXT_K].contiguous()
+    rx_all_center = rx_all[Config.CONTEXT_K : rx_all.size(0) - Config.CONTEXT_K].contiguous()
+    tx_all_center = tx_all[Config.CONTEXT_K : tx_all.size(0) - Config.CONTEXT_K].contiguous()
 
     return {
         "train_x": train_x,
@@ -1284,10 +1290,16 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         "val_y": val_y,
         "test_x": test_x,
         "test_y": test_y,
+        "all_x": all_x,
+        "all_y": all_y,
         "tx_test": tx_test,
         "rx_test": rx_test,
         "tx_test_center": tx_test_center,
         "rx_test_center": rx_test_center,
+        "tx_all": tx_all,
+        "rx_all": rx_all,
+        "tx_all_center": tx_all_center,
+        "rx_all_center": rx_all_center,
         "mean": mean,
         "std": std,
         "tx_scale": tx_scale,
@@ -1392,13 +1404,14 @@ def evaluate_split(
 
 @torch.inference_mode()
 def compute_test_metrics(model: nn.Module, data: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    baseline_scale = find_best_symbol_scale(data["tx_test_center"], data["rx_test_center"])
-    tx_cls = symbols_to_classes(data["tx_test_center"].to(Config.DEVICE))
-    rx_cls = symbols_to_classes((data["rx_test_center"] * baseline_scale).to(Config.DEVICE))
+    eval_prefix = "all" if Config.EVAL_ON_ALL_FILES else "test"
+    baseline_scale = find_best_symbol_scale(data[f"tx_{eval_prefix}_center"], data[f"rx_{eval_prefix}_center"])
+    tx_cls = symbols_to_classes(data[f"tx_{eval_prefix}_center"].to(Config.DEVICE))
+    rx_cls = symbols_to_classes((data[f"rx_{eval_prefix}_center"] * baseline_scale).to(Config.DEVICE))
     baseline_ber = calculate_ber_from_classes(tx_cls, rx_cls)
     eval_batch_size = data.get("eval_batch_size", Config.EVAL_BATCH_SIZE)
     test_loss, test_acc, test_ber, safe_eval_batch_size, equalizer_scale = evaluate_split(
-        model, data["test_x"], data["test_y"], eval_batch_size, scale_search=True
+        model, data[f"{eval_prefix}_x"], data[f"{eval_prefix}_y"], eval_batch_size, scale_search=True
     )
     return {
         "baseline_ber": baseline_ber,
