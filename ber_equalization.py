@@ -11,6 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+try:
+    from efficient_kan import KAN as EfficientKAN
+except ImportError:
+    EfficientKAN = None
+
 
 class Config:
     DEVICE = torch.device(
@@ -24,9 +29,9 @@ class Config:
     SEQ_LEN = 2 * CONTEXT_K + 1
     INPUT_DIM = 2
 
-    HIDDEN_DIM = 64
+    HIDDEN_DIM = 64 # надо 64
     DROPOUT = 0.2
-    LSTM_HIDDEN = 64
+    LSTM_HIDDEN = 64 # надо 64
     LSTM_LAYERS = 2
     BIDIRECTIONAL = True
     USE_ATTENTION = True
@@ -41,6 +46,9 @@ class Config:
     COMPLEX_HEAD_DIM = 128
     COMPLEX_TEMPORAL_DIM = 96
     COMPLEX_TEMPORAL_DILATIONS = [1, 2, 4]
+    COMPLEX_LIGHT_CHANNELS = 48
+    COMPLEX_LIGHT_DILATIONS = [1, 2, 4]
+    COMPLEX_LIGHT_KERNEL_SIZE = 3
     COMPLEX_SEQ_DIM = 96
     COMPLEX_LSTM_HIDDEN = 64
     COMPLEX_LSTM_LAYERS = 2
@@ -64,7 +72,28 @@ class Config:
     DBP_JOINT_INIT_LR = 2e-3
     DBP_SEQSTAT_DIM = 128
 
-    EPOCHS = 160
+    FASTKAN_HIDDEN_DIM = 96
+    FASTKAN_LAYERS = 2
+    FASTKAN_NUM_GRIDS = 8
+    FASTKAN_GRID_MIN = -2.5
+    FASTKAN_GRID_MAX = 2.5
+    FASTKAN_BASE_ACT = "silu"
+    FASTKAN_USE_BASE_PATH = True
+    KAN_INPUT_DROPOUT = 0.05
+    KAN_HIDDEN_DROPOUT = 0.1
+    KAN_PRUNE_L1 = 1e-5
+    KAN_PRUNE_THRESHOLD = 0.02
+    EFFICIENT_KAN_HIDDEN_DIM = 128
+    EFFICIENT_KAN_LAYERS = 2
+    EFFICIENT_KAN_GRID_SIZE = 8
+    EFFICIENT_KAN_SPLINE_ORDER = 3
+    EFFICIENT_KAN_GRID_EPS = 0.02
+    EFFICIENT_KAN_GRID_RANGE = [-3.0, 3.0]
+    EFFICIENT_KAN_SCALE_NOISE = 0.1
+    EFFICIENT_KAN_SCALE_BASE = 1.0
+    EFFICIENT_KAN_SCALE_SPLINE = 1.0
+
+    EPOCHS = 250
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 0.0
     TRAIN_BLOCK_SIZE = 16384
@@ -96,7 +125,7 @@ class Config:
     BER_SCALE_SAMPLES = 1 << 20
 
     OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["lstm", "cnn_lstm", "complex_lstm", "complex_cnn_lstm"]
+    MODEL_TYPES = ["efficient_kan_baseline"]
     SAVE_BEST = True
     RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
@@ -444,6 +473,223 @@ class TemporalConvBlock(nn.Module):
         x = self.activation(self.pointwise(x))
         x = self.dropout(x)
         return x + residual
+
+
+class LightweightComplexTemporalBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dilation: int):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.norm = nn.BatchNorm1d(channels)
+        self.depthwise = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,
+            bias=False,
+        )
+        self.mix = nn.Conv1d(channels, channels * 2, kernel_size=1, bias=False)
+        self.gate_proj = nn.Conv1d(1, channels * 2, kernel_size=1, bias=True)
+        self.out_proj = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+        self.dropout = nn.Dropout(Config.DROPOUT * 0.5)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in (self.depthwise, self.mix, self.gate_proj, self.out_proj):
+            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor, power: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.depthwise(x)
+        value, gate = self.mix(x).chunk(2, dim=1)
+        power_gate = self.gate_proj(power)
+        value = F.gelu(value + power_gate[:, : value.size(1), :])
+        gate = torch.sigmoid(gate + power_gate[:, value.size(1) :, :])
+        x = self.out_proj(value * gate)
+        x = self.dropout(x)
+        return x + residual
+
+
+class LightweightComplexEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        channels = Config.COMPLEX_LIGHT_CHANNELS
+        self.stem = nn.Sequential(
+            nn.Conv1d(5, channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                LightweightComplexTemporalBlock(
+                    channels=channels,
+                    kernel_size=Config.COMPLEX_LIGHT_KERNEL_SIZE,
+                    dilation=dilation,
+                )
+                for dilation in Config.COMPLEX_LIGHT_DILATIONS
+            ]
+        )
+        self.out_norm = nn.BatchNorm1d(channels)
+        self.out_channels = channels
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        seq = raw.transpose(1, 2)
+        real = seq[:, 0:1, :]
+        imag = seq[:, 1:2, :]
+        power = real.square() + imag.square()
+        magnitude = torch.sqrt(power + 1e-6)
+        cross = real * imag
+        features = torch.cat([real, imag, magnitude, power, cross], dim=1)
+        hidden = self.stem(features)
+        for block in self.blocks:
+            hidden = block(hidden, power)
+        hidden = self.out_norm(hidden)
+        seq_features = torch.cat([hidden, real, imag, magnitude], dim=1).transpose(1, 2)
+        return raw, hidden, seq_features
+
+
+class GaussianRBFExpansion(nn.Module):
+    def __init__(self, num_grids: int, grid_min: float, grid_max: float):
+        super().__init__()
+        centers = torch.linspace(grid_min, grid_max, num_grids)
+        spacing = float(centers[1] - centers[0]) if num_grids > 1 else max(abs(grid_max - grid_min), 1.0)
+        self.register_buffer("centers", centers)
+        self.log_inv_scale = nn.Parameter(torch.log(torch.tensor(1.0 / max(spacing, 1e-3))))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inv_scale = self.log_inv_scale.exp().clamp(1e-3, 1e3)
+        diff = (x.unsqueeze(-1) - self.centers) * inv_scale
+        return torch.exp(-(diff * diff))
+
+
+class FastKANLayer(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rbf = GaussianRBFExpansion(
+            num_grids=Config.FASTKAN_NUM_GRIDS,
+            grid_min=Config.FASTKAN_GRID_MIN,
+            grid_max=Config.FASTKAN_GRID_MAX,
+        )
+        self.base_linear = nn.Linear(in_features, out_features)
+        self.spline_linear = nn.Linear(in_features * Config.FASTKAN_NUM_GRIDS, out_features)
+        self.norm = nn.LayerNorm(out_features)
+        self.dropout = nn.Dropout(Config.KAN_HIDDEN_DROPOUT)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.base_linear.weight)
+        nn.init.zeros_(self.base_linear.bias)
+        nn.init.xavier_uniform_(self.spline_linear.weight)
+        nn.init.zeros_(self.spline_linear.bias)
+        nn.init.constant_(self.norm.weight, 1.0)
+        nn.init.constant_(self.norm.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if Config.FASTKAN_BASE_ACT == "gelu":
+            base = F.gelu(x)
+        else:
+            base = F.silu(x)
+        base_out = self.base_linear(base) if Config.FASTKAN_USE_BASE_PATH else 0.0
+        spline_basis = self.rbf(x).flatten(start_dim=1)
+        spline_out = self.spline_linear(spline_basis)
+        out = self.norm(base_out + spline_out)
+        return self.dropout(F.gelu(out))
+
+    def regularization_loss(self) -> torch.Tensor:
+        return self.spline_linear.weight.abs().mean()
+
+
+class FastKANHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, out_dim: int):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_dropout = nn.Dropout(Config.KAN_INPUT_DROPOUT)
+        self.feature_gate = nn.Parameter(torch.ones(input_dim))
+        self.layers = nn.ModuleList()
+        in_dim = input_dim
+        for _ in range(Config.FASTKAN_LAYERS):
+            self.layers.append(FastKANLayer(in_dim, hidden_dim))
+            in_dim = hidden_dim
+        self.output = nn.Linear(in_dim, out_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        nn.init.constant_(self.input_norm.weight, 1.0)
+        nn.init.constant_(self.input_norm.bias, 0.0)
+
+    def _gated_features(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.feature_gate
+        if not self.training and Config.KAN_PRUNE_THRESHOLD > 0:
+            gate = gate * (gate.abs() >= Config.KAN_PRUNE_THRESHOLD)
+        return x * gate.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_dropout(self.input_norm(x))
+        x = self._gated_features(x)
+        for layer in self.layers:
+            x = layer(x)
+        return self.output(x)
+
+    def regularization_loss(self) -> torch.Tensor:
+        reg = self.feature_gate.abs().mean()
+        for layer in self.layers:
+            reg = reg + layer.regularization_loss()
+        return reg
+
+
+class EfficientKANBaselineEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        if EfficientKAN is None:
+            raise ImportError(
+                "efficient_kan is unavailable. Keep the local `efficient_kan/` package next to this script or "
+                "install the library before running."
+            )
+
+        input_dim = Config.SEQ_LEN * Config.INPUT_DIM
+        hidden_layers = [Config.EFFICIENT_KAN_HIDDEN_DIM] * max(Config.EFFICIENT_KAN_LAYERS, 1)
+        self.kan = EfficientKAN(
+            layers_hidden=[input_dim, *hidden_layers, 2],
+            grid_size=Config.EFFICIENT_KAN_GRID_SIZE,
+            spline_order=Config.EFFICIENT_KAN_SPLINE_ORDER,
+            scale_noise=Config.EFFICIENT_KAN_SCALE_NOISE,
+            scale_base=Config.EFFICIENT_KAN_SCALE_BASE,
+            scale_spline=Config.EFFICIENT_KAN_SCALE_SPLINE,
+            base_activation=nn.SiLU,
+            grid_eps=Config.EFFICIENT_KAN_GRID_EPS,
+            grid_range=Config.EFFICIENT_KAN_GRID_RANGE,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kan(x)
+
+    def regularization_loss(self) -> torch.Tensor:
+        if hasattr(self.kan, "regularization_loss"):
+            reg = self.kan.regularization_loss()
+            if torch.is_tensor(reg):
+                return reg
+            return torch.tensor(float(reg), device=Config.DEVICE)
+        return torch.zeros((), device=Config.DEVICE)
 
 
 class ComplexFeatureEncoder(nn.Module):
@@ -894,6 +1140,32 @@ class ComplexCNNLSTMRxEqualizer(nn.Module):
         return self.head(fused)
 
 
+class ComplexFastKANEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = LightweightComplexEncoder()
+        fused_dim = 3 * (self.encoder.out_channels + 3) + 2 * Config.INPUT_DIM + 1
+        self.head = FastKANHead(
+            input_dim=fused_dim,
+            hidden_dim=Config.FASTKAN_HIDDEN_DIM,
+            out_dim=2,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw, _, seq_features = self.encoder(x)
+        center = seq_features[:, Config.CONTEXT_K, :]
+        mean = seq_features.mean(dim=1)
+        std = seq_features.std(dim=1, unbiased=False)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        raw_mean = raw.mean(dim=1)
+        power_center = raw_center.square().sum(dim=1, keepdim=True)
+        fused = torch.cat([center, mean, std, raw_center, raw_mean, power_center], dim=1)
+        return self.head(fused)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return self.head.regularization_loss()
+
+
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, dim: int, heads: int, ff_dim: int):
         super().__init__()
@@ -1047,12 +1319,21 @@ def build_optimizer(model: nn.Module) -> optim.Optimizer:
     if Config.DEVICE.type == "cuda":
         optimizer_kwargs["fused"] = True
     optimizer_name = Config.OPTIMIZER.lower()
-    optimizer_cls = optim.Adam if optimizer_name == "adam" else optim.AdamW
+    optimizer_cls = optim.Adam if optimizer_name == "adam" else optim.RMSprop
     try:
         return optimizer_cls(model.parameters(), **optimizer_kwargs)
     except TypeError:
         optimizer_kwargs.pop("fused", None)
         return optimizer_cls(model.parameters(), **optimizer_kwargs)
+
+
+def compute_model_regularization(model: nn.Module) -> torch.Tensor:
+    if Config.KAN_PRUNE_L1 <= 0 or not hasattr(model, "regularization_loss"):
+        return torch.zeros((), device=Config.DEVICE)
+    reg = model.regularization_loss()
+    if not torch.is_tensor(reg):
+        reg = torch.tensor(float(reg), device=Config.DEVICE)
+    return reg * Config.KAN_PRUNE_L1
 
 
 def complex_unit_response(response: torch.Tensor, order: int) -> torch.Tensor:
@@ -1308,10 +1589,14 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
 
 
 def make_model(name: str) -> nn.Module:
+    if name in {"efficient_kan_baseline", "efficient_kan", "ekan"}:
+        return EfficientKANBaselineEqualizer().to(Config.DEVICE)
     if name == "lstm":
         return LSTMRxEqualizer().to(Config.DEVICE)
     if name in {"hybrid", "cnn_lstm"}:
         return HybridCNNLSTMEqualizer().to(Config.DEVICE)
+    if name in {"complex_fastkan", "fastkan", "kan"}:
+        return ComplexFastKANEqualizer().to(Config.DEVICE)
     if name == "complex_lstm":
         return ComplexLSTMRxEqualizer().to(Config.DEVICE)
     if name == "complex_dbp_seqstat":
@@ -1696,6 +1981,7 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
                         mark_cudagraph_step_begin()
                         preds = model(xb)
                         loss = criterion(preds, yb)
+                        loss = loss + compute_model_regularization(model)
                     scaler.scale(loss).backward()
                     if Config.GRAD_CLIP_NORM > 0:
                         scaler.unscale_(optimizer)
