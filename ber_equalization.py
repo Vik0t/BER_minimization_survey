@@ -125,7 +125,7 @@ class Config:
     BER_SCALE_SAMPLES = 1 << 20
 
     OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["efficient_kan_baseline"]
+    MODEL_TYPES = ["mlp"]
     SAVE_BEST = True
     RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
@@ -320,6 +320,64 @@ class HybridCNNLSTMEqualizer(nn.Module):
         x, _ = self.lstm(x)
         x = self.attention(x)
         return self.classifier(x)
+
+
+class CNNRxEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        hidden_dim = Config.HIDDEN_DIM
+        self.cnn = nn.Sequential(
+            nn.Conv1d(Config.INPUT_DIM, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.25),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.25),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.25),
+        )
+        self.pool_score = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+        fused_dim = hidden_dim * 2 + 2 * Config.INPUT_DIM
+        self.head = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.5),
+            nn.Linear(hidden_dim // 2, 2),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, (nn.BatchNorm1d, nn.LayerNorm)):
+                if hasattr(module, "weight") and module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+                if hasattr(module, "bias") and module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        seq = raw.transpose(1, 2)
+        features = self.cnn(seq)
+        center = features[:, :, Config.CONTEXT_K]
+        weights = torch.softmax(self.pool_score(features), dim=2)
+        global_context = torch.sum(weights * features, dim=2)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        raw_mean = raw.mean(dim=1)
+        fused = torch.cat([center, global_context, raw_center, raw_mean], dim=1)
+        return self.head(fused)
 
 
 class ComplexConv1d(nn.Module):
@@ -1278,10 +1336,6 @@ class MLPRxEqualizer(nn.Module):
             nn.LayerNorm(Config.HIDDEN_DIM),
             nn.GELU(),
             nn.Dropout(Config.DROPOUT),
-            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM),
-            nn.LayerNorm(Config.HIDDEN_DIM),
-            nn.GELU(),
-            nn.Dropout(Config.DROPOUT),
             nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
             nn.LayerNorm(Config.HIDDEN_DIM // 2),
             nn.GELU(),
@@ -1293,7 +1347,7 @@ class MLPRxEqualizer(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                nn.init.kaiming_normal_(module.weight, nonlinearity="tanh")
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
             elif isinstance(module, nn.LayerNorm):
@@ -1591,6 +1645,8 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
 def make_model(name: str) -> nn.Module:
     if name in {"efficient_kan_baseline", "efficient_kan", "ekan"}:
         return EfficientKANBaselineEqualizer().to(Config.DEVICE)
+    if name == "cnn":
+        return CNNRxEqualizer().to(Config.DEVICE)
     if name == "lstm":
         return LSTMRxEqualizer().to(Config.DEVICE)
     if name in {"hybrid", "cnn_lstm"}:
