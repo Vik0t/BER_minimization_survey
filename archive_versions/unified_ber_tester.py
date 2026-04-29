@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-import experiment1 as exp
+import archive_versions.experiment1 as exp
 
 
 CONSTELLATION = torch.tensor(

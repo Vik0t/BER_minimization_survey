@@ -92,6 +92,7 @@ class Config:
     EFFICIENT_KAN_SCALE_NOISE = 0.1
     EFFICIENT_KAN_SCALE_BASE = 1.0
     EFFICIENT_KAN_SCALE_SPLINE = 1.0
+    KAN_FEATURE_RADIUS = 2
 
     EPOCHS = 250
     LEARNING_RATE = 1e-3
@@ -125,7 +126,15 @@ class Config:
     BER_SCALE_SAMPLES = 1 << 20
 
     OUT_DIR = Path("clean_compare_outputs")
-    MODEL_TYPES = ["mlp"]
+    MODEL_TYPES = [
+        "efficient_kan_baseline",
+        "efficient_kan_residual",
+        "efficient_kan_features",
+        "cnn_kan",
+        "kan_classifier",
+        "mlp",
+        "cnn",
+    ]
     SAVE_BEST = True
     RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
@@ -750,6 +759,163 @@ class EfficientKANBaselineEqualizer(nn.Module):
         return torch.zeros((), device=Config.DEVICE)
 
 
+def make_efficient_kan(input_dim: int, output_dim: int) -> nn.Module:
+    if EfficientKAN is None:
+        raise ImportError(
+            "efficient_kan is unavailable. Keep the local `efficient_kan/` package next to this script or "
+            "install the library before running."
+        )
+    hidden_layers = [Config.EFFICIENT_KAN_HIDDEN_DIM] * max(Config.EFFICIENT_KAN_LAYERS, 1)
+    return EfficientKAN(
+        layers_hidden=[input_dim, *hidden_layers, output_dim],
+        grid_size=Config.EFFICIENT_KAN_GRID_SIZE,
+        spline_order=Config.EFFICIENT_KAN_SPLINE_ORDER,
+        scale_noise=Config.EFFICIENT_KAN_SCALE_NOISE,
+        scale_base=Config.EFFICIENT_KAN_SCALE_BASE,
+        scale_spline=Config.EFFICIENT_KAN_SCALE_SPLINE,
+        base_activation=nn.SiLU,
+        grid_eps=Config.EFFICIENT_KAN_GRID_EPS,
+        grid_range=Config.EFFICIENT_KAN_GRID_RANGE,
+    )
+
+
+def efficient_kan_regularization(kan: nn.Module) -> torch.Tensor:
+    if hasattr(kan, "regularization_loss"):
+        reg = kan.regularization_loss()
+        if torch.is_tensor(reg):
+            return reg
+        return torch.tensor(float(reg), device=Config.DEVICE)
+    return torch.zeros((), device=Config.DEVICE)
+
+
+class EfficientKANResidualEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        input_dim = Config.SEQ_LEN * Config.INPUT_DIM
+        self.kan = make_efficient_kan(input_dim=input_dim, output_dim=2)
+        self.residual_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        center_rx = raw[:, Config.CONTEXT_K, :]
+        correction = self.kan(x)
+        return center_rx + self.residual_scale * correction
+
+    def regularization_loss(self) -> torch.Tensor:
+        return efficient_kan_regularization(self.kan)
+
+
+class EfficientKANFeatureEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feature_dim = 17
+        self.kan = make_efficient_kan(input_dim=self.feature_dim, output_dim=2)
+
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        center = raw[:, Config.CONTEXT_K, :]
+        radius = min(Config.KAN_FEATURE_RADIUS, Config.CONTEXT_K)
+        local = raw[:, Config.CONTEXT_K - radius : Config.CONTEXT_K + radius + 1, :]
+
+        global_mean = raw.mean(dim=1)
+        global_std = raw.std(dim=1, unbiased=False)
+        local_mean = local.mean(dim=1)
+        local_std = local.std(dim=1, unbiased=False)
+
+        power = raw.square().sum(dim=2)
+        power_center = power[:, Config.CONTEXT_K : Config.CONTEXT_K + 1]
+        power_mean = power.mean(dim=1, keepdim=True)
+        power_std = power.std(dim=1, unbiased=False, keepdim=True)
+
+        cross = raw[:, :, 0] * raw[:, :, 1]
+        cross_mean = cross.mean(dim=1, keepdim=True)
+        cross_std = cross.std(dim=1, unbiased=False, keepdim=True)
+        edge_delta = raw[:, -1, :] - raw[:, 0, :]
+
+        return torch.cat(
+            [
+                center,
+                local_mean,
+                local_std,
+                global_mean,
+                global_std,
+                power_center,
+                power_mean,
+                power_std,
+                cross_mean,
+                cross_std,
+                edge_delta,
+            ],
+            dim=1,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kan(self._features(x))
+
+    def regularization_loss(self) -> torch.Tensor:
+        return efficient_kan_regularization(self.kan)
+
+
+class CNNKANEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        hidden_dim = Config.HIDDEN_DIM
+        self.cnn = nn.Sequential(
+            nn.Conv1d(Config.INPUT_DIM, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+        )
+        self.pool_score = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+        fused_dim = hidden_dim * 2 + 2 * Config.INPUT_DIM
+        self.kan = make_efficient_kan(input_dim=fused_dim, output_dim=2)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.cnn.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.kaiming_normal_(self.pool_score.weight, nonlinearity="linear")
+        nn.init.constant_(self.pool_score.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        features = self.cnn(raw.transpose(1, 2))
+        center = features[:, :, Config.CONTEXT_K]
+        weights = torch.softmax(self.pool_score(features), dim=2)
+        global_context = torch.sum(weights * features, dim=2)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        raw_mean = raw.mean(dim=1)
+        fused = torch.cat([center, global_context, raw_center, raw_mean], dim=1)
+        return self.kan(fused)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return efficient_kan_regularization(self.kan)
+
+
+class EfficientKANClassifierEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        input_dim = Config.SEQ_LEN * Config.INPUT_DIM
+        self.kan = make_efficient_kan(input_dim=input_dim, output_dim=CONSTELLATION.size(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kan(x)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return efficient_kan_regularization(self.kan)
+
+
 class ComplexFeatureEncoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1362,10 +1528,36 @@ def log(msg: str):
     print(msg, flush=True)
 
 
+MODEL_NOTES = {
+    "efficient_kan_baseline": "flat IQ window -> KAN -> corrected I/Q",
+    "efficient_kan_residual": "flat IQ window -> KAN correction -> rx center + correction",
+    "efficient_kan_features": "handcrafted local/global IQ features -> KAN -> corrected I/Q",
+    "cnn_kan": "CNN extracts temporal features -> KAN head -> corrected I/Q",
+    "kan_classifier": "flat IQ window -> KAN -> 16 constellation logits",
+    "mlp": "flat IQ window -> MLP -> corrected I/Q",
+    "cnn": "CNN extracts temporal features -> MLP head -> corrected I/Q",
+}
+
+
+def count_trainable_parameters(model: nn.Module) -> int:
+    return sum(param.numel() for param in model.parameters() if param.requires_grad)
+
+
 def build_criterion() -> nn.Module:
     if Config.LOSS == "smooth_l1":
         return nn.SmoothL1Loss(beta=0.05)
     return nn.MSELoss()
+
+
+def is_classifier_output(preds: torch.Tensor) -> bool:
+    return preds.dim() == 2 and preds.size(1) == CONSTELLATION.size(0)
+
+
+def prediction_loss(preds: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
+    if is_classifier_output(preds):
+        target_classes = symbols_to_classes(targets.float())
+        return F.cross_entropy(preds.float(), target_classes)
+    return criterion(preds, targets)
 
 
 def build_optimizer(model: nn.Module) -> optim.Optimizer:
@@ -1645,6 +1837,14 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
 def make_model(name: str) -> nn.Module:
     if name in {"efficient_kan_baseline", "efficient_kan", "ekan"}:
         return EfficientKANBaselineEqualizer().to(Config.DEVICE)
+    if name in {"efficient_kan_residual", "kan_residual", "residual_kan"}:
+        return EfficientKANResidualEqualizer().to(Config.DEVICE)
+    if name in {"efficient_kan_features", "kan_features", "feature_kan"}:
+        return EfficientKANFeatureEqualizer().to(Config.DEVICE)
+    if name in {"cnn_kan", "kan_cnn"}:
+        return CNNKANEqualizer().to(Config.DEVICE)
+    if name in {"kan_classifier", "efficient_kan_classifier"}:
+        return EfficientKANClassifierEqualizer().to(Config.DEVICE)
     if name == "cnn":
         return CNNRxEqualizer().to(Config.DEVICE)
     if name == "lstm":
@@ -1707,7 +1907,7 @@ def evaluate_split(
                 with autocast_context():
                     mark_cudagraph_step_begin()
                     preds = model(xb)
-                    loss = criterion(preds, yb)
+                    loss = prediction_loss(preds, yb, criterion)
                 preds_float = preds.float()
                 target_float = yb.float()
                 preds_accum.append(preds_float.detach().cpu())
@@ -1717,9 +1917,13 @@ def evaluate_split(
                 total_samples += batch_size_now
             preds_all = torch.cat(preds_accum, dim=0)
             targets_all = torch.cat(targets_accum, dim=0)
-            scale = find_best_symbol_scale(targets_all, preds_all) if scale_search else 1.0
-            pred_classes = symbols_to_classes((preds_all * scale).to(Config.DEVICE))
             target_classes = symbols_to_classes(targets_all.to(Config.DEVICE))
+            if is_classifier_output(preds_all):
+                scale = 1.0
+                pred_classes = torch.argmax(preds_all.to(Config.DEVICE), dim=1)
+            else:
+                scale = find_best_symbol_scale(targets_all, preds_all) if scale_search else 1.0
+                pred_classes = symbols_to_classes((preds_all * scale).to(Config.DEVICE))
             correct = (pred_classes == target_classes).sum().item()
             tx_bits = bit_labels[target_classes]
             rx_bits = bit_labels[pred_classes]
@@ -1974,6 +2178,10 @@ def run_sweep_experiments():
 
 def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
     model = make_model(model_name)
+    log(
+        f"{model_name} | params {count_trainable_parameters(model):,} | "
+        f"{MODEL_NOTES.get(model_name, 'custom equalizer')}"
+    )
     if hasattr(model, "initialize_from_data"):
         model.initialize_from_data(data["train_x"], data["train_y"])
         log(f"{model_name} | initialized from training windows")
@@ -2036,7 +2244,7 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
                     with autocast_context():
                         mark_cudagraph_step_begin()
                         preds = model(xb)
-                        loss = criterion(preds, yb)
+                        loss = prediction_loss(preds, yb, criterion)
                         loss = loss + compute_model_regularization(model)
                     scaler.scale(loss).backward()
                     if Config.GRAD_CLIP_NORM > 0:

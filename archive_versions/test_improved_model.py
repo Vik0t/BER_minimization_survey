@@ -7,7 +7,7 @@ Test script for the improved model with PolarizationPhaseActivation
 try:
     import torch
     import torch.nn as nn
-    from experiment1 import (
+    from archive_versions.experiment1 import (
         Config, 
         LSTMRxEqualizer, 
         HybridCNN_LSTM_Equalizer,
