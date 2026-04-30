@@ -1499,13 +1499,13 @@ class MLPRxEqualizer(nn.Module):
         input_dim = Config.SEQ_LEN * Config.INPUT_DIM
         self.net = nn.Sequential(
             nn.Linear(input_dim, Config.HIDDEN_DIM),
-            nn.LayerNorm(Config.HIDDEN_DIM),
+            ##nn.LayerNorm(Config.HIDDEN_DIM),
             nn.GELU(),
-            nn.Dropout(Config.DROPOUT),
+            ##nn.Dropout(Config.DROPOUT),
             nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
-            nn.LayerNorm(Config.HIDDEN_DIM // 2),
+            ##nn.LayerNorm(Config.HIDDEN_DIM // 2),
             nn.GELU(),
-            nn.Dropout(Config.DROPOUT * 0.5),
+            ##nn.Dropout(Config.DROPOUT * 0.5),
             nn.Linear(Config.HIDDEN_DIM // 2, 2),
         )
         self._init_weights()

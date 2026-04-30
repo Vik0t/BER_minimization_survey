@@ -156,7 +156,7 @@ Output: raw_center + learned_correction
 Mathematically:
 
 ```text
-\hat{y}_t = x_t^{center} + alpha * f_KAN(x_t)
+ 
 ```
 
 where `alpha` is a learned scalar `residual_scale`.
@@ -190,7 +190,7 @@ Speed = ~309k samples/s
 
 This did not outperform the direct KAN baseline. The likely reason is scale mismatch: `raw_center` is taken from standardized RX windows, while the target TX symbol is power-normalized but not standardized in the same way. A residual architecture is still promising, but the residual base should be a properly scaled RX center or a linear/FIR estimate.
 
-## Architecture 3: EfficientKAN with Handcrafted Features
+## Architecture 3: EfficientKAN with Handcrafted Featuresста
 
 Code class:
 
