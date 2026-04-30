@@ -1497,31 +1497,63 @@ class MLPRxEqualizer(nn.Module):
     def __init__(self):
         super().__init__()
         input_dim = Config.SEQ_LEN * Config.INPUT_DIM
+        hidden_dim = Config.HIDDEN_DIM
+        self.skip = nn.Linear(input_dim, 2)
         self.net = nn.Sequential(
             nn.Linear(input_dim, Config.HIDDEN_DIM),
-            ##nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
             nn.GELU(),
-            ##nn.Dropout(Config.DROPOUT),
-            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
-            ##nn.LayerNorm(Config.HIDDEN_DIM // 2),
+            nn.Linear(Config.HIDDEN_DIM, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            ##nn.Dropout(Config.DROPOUT * 0.5),
-            nn.Linear(Config.HIDDEN_DIM // 2, 2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 2),
         )
         self._init_weights()
 
     def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="tanh")
+        with torch.no_grad():
+            self.skip.weight.zero_()
+            self.skip.bias.zero_()
+            center_start = Config.CONTEXT_K * Config.INPUT_DIM
+            self.skip.weight[:, center_start : center_start + Config.INPUT_DIM] = torch.eye(2)
+
+        linear_layers = [module for module in self.net.modules() if isinstance(module, nn.Linear)]
+        for idx, module in enumerate(linear_layers):
+            if idx == len(linear_layers) - 1:
+                nn.init.zeros_(module.weight)
+                nn.init.constant_(module.bias, 0.0)
+            else:
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
+        for module in self.net.modules():
+            if isinstance(module, nn.LayerNorm):
                 nn.init.constant_(module.bias, 0)
                 nn.init.constant_(module.weight, 1.0)
 
+    @torch.no_grad()
+    def initialize_from_data(self, train_x: torch.Tensor, train_y: torch.Tensor):
+        samples = min(train_x.size(0), 262_144)
+        if samples < 3:
+            return
+        center = train_x[:samples].view(samples, Config.SEQ_LEN, Config.INPUT_DIM)[:, Config.CONTEXT_K, :].float()
+        target = train_y[:samples].float()
+        ones = torch.ones(samples, 1, dtype=center.dtype, device=center.device)
+        design = torch.cat([center, ones], dim=1)
+        solution = torch.linalg.lstsq(design, target).solution
+
+        self.skip.weight.zero_()
+        self.skip.bias.copy_(solution[-1].to(self.skip.bias.device, dtype=self.skip.bias.dtype))
+        center_start = Config.CONTEXT_K * Config.INPUT_DIM
+        self.skip.weight[:, center_start : center_start + Config.INPUT_DIM].copy_(
+            solution[: Config.INPUT_DIM].T.to(self.skip.weight.device, dtype=self.skip.weight.dtype)
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.skip(x) + self.net(x)
 
 
 def log(msg: str):
@@ -2222,6 +2254,24 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
     train_y = data["train_y"]
     train_block_size = Config.TRAIN_BLOCK_SIZE
     eval_batch_size = Config.EVAL_BATCH_SIZE
+
+    if Config.SAVE_BEST_BY in {"val_ber", "val_loss"}:
+        init_val_loss, _, init_val_ber, eval_batch_size, _ = evaluate_split(
+            model,
+            data["val_x"],
+            data["val_y"],
+            eval_batch_size,
+            scale_search=True,
+        )
+        best_val_ber = init_val_ber
+        best_score = init_val_ber if Config.SAVE_BEST_BY == "val_ber" else init_val_loss
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if Config.SAVE_BEST:
+            torch.save(best_state, Config.OUT_DIR / f"{model_name}_best.pth")
+        log(
+            f"{model_name} | init checkpoint | val {init_val_loss:.6f} | "
+            f"val_ber {init_val_ber:.6e}"
+        )
 
     for epoch in range(Config.EPOCHS):
         model.train()
