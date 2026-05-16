@@ -759,3 +759,42 @@ Append all future results below this section.
 ### 2026-05-10: Study plan created
 
 Created the EfficientKAN-focused research plan. No new runs in this entry.
+
+### 2026-05-16: Split protocol tightened
+
+Found and fixed an important evaluation issue in `ber_equalization.py`.
+
+Previous protocol risk:
+
+```text
+Config.EVAL_ON_ALL_FILES = True
+compute_test_metrics() used all_x/all_y
+```
+
+That meant the reported `test_ber` could be computed on all files, including train and validation files. This explains the suspicious behavior where test BER was much lower than validation BER.
+
+New protocol:
+
+```text
+1. Split is file-level: train+val files are separated from hold-out test files.
+2. Validation is carved out inside the train+val pool using VAL_PORTION_WITHIN_TRAIN.
+3. Normalization statistics are computed only from train files.
+4. Test files are not evaluated during training by default.
+5. Final test BER is computed only once after loading the best validation checkpoint.
+```
+
+Current split-related defaults:
+
+```text
+TRAIN_PORTION = 0.97
+VAL_PORTION_WITHIN_TRAIN = 0.10
+MIN_VAL_FILES = 1
+EVAL_TEST_DURING_TRAINING = False
+```
+
+Interpretation for future comparisons:
+
+```text
+Old reported test curves should be treated carefully if they were produced with EVAL_ON_ALL_FILES=True.
+New runs are stricter and should be compared primarily by best_val_ber and final hold-out equalized_ber.
+```

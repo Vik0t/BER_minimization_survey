@@ -23,13 +23,16 @@ class Config:
     )
     DATA_DIR_CANDIDATES = [Path("symbols_new"), Path("Symbols_1m_1ch_PR"), Path(".")]
     MAX_FILES = 64
+    # File-level split: first TRAIN_PORTION files form train+val pool, the rest is a hold-out test set.
     TRAIN_PORTION = 0.97
+    VAL_PORTION_WITHIN_TRAIN = 0.10
+    MIN_VAL_FILES = 1
 
     CONTEXT_K = 32
     SEQ_LEN = 2 * CONTEXT_K + 1
     INPUT_DIM = 2
 
-    HIDDEN_DIM = 64 # надо 64
+    HIDDEN_DIM = 96 # надо 64
     DROPOUT = 0.2
     LSTM_HIDDEN = 64 # надо 64
     LSTM_LAYERS = 2
@@ -85,7 +88,7 @@ class Config:
     KAN_PRUNE_THRESHOLD = 0.02
     EFFICIENT_KAN_HIDDEN_DIM = 128
     EFFICIENT_KAN_LAYERS = 2
-    EFFICIENT_KAN_GRID_SIZE = 8
+    EFFICIENT_KAN_GRID_SIZE = 20
     EFFICIENT_KAN_SPLINE_ORDER = 3
     EFFICIENT_KAN_GRID_EPS = 0.02
     EFFICIENT_KAN_GRID_RANGE = [-3.0, 3.0]
@@ -116,7 +119,7 @@ class Config:
     LOG_EVERY = 1
     TEST_BER_EVERY = 10
     SAVE_BEST_BY = "val_ber"
-    EVAL_ON_ALL_FILES = True
+    EVAL_TEST_DURING_TRAINING = False
     POWER_NORMALIZE = True
     BER_SCALE_SEARCH = True
     BER_SCALE_MIN = 0.5
@@ -126,25 +129,23 @@ class Config:
     BER_SCALE_SAMPLES = 1 << 20
 
     OUT_DIR = Path("clean_compare_outputs")
-    RUN_MAIN_EXPERIMENTS = False
+    RUN_MAIN_EXPERIMENTS = True
     MODEL_TYPES = [
         "efficient_kan_baseline",
-        "efficient_kan_residual",   
-        "cnn_kan",
         "kan_classifier",
     
     ]
     SAVE_BEST = True
-    RUN_SWEEP_EXPERIMENTS = True
+    RUN_SWEEP_EXPERIMENTS = False
     SWEEP_TEST_FILES = 1
     WINDOW_SWEEP_VALUES = [2, 4, 8, 12, 16, 20]
     HIDDEN_SWEEP_VALUES = [8, 16, 32, 64]
-    RUN_EFFICIENT_KAN_SWEEP = True
-    EFFICIENT_KAN_SWEEP_MODELS = ["efficient_kan_baseline", "kan_classifier"]
+    RUN_EFFICIENT_KAN_SWEEP = False
+    EFFICIENT_KAN_SWEEP_MODELS = ["mlp", "efficient_kan_baseline", "kan_classifier"]
     EFFICIENT_KAN_SWEEP_EPOCHS = 60
     EFFICIENT_KAN_SWEEP_TEST_FILES = 1
     EFFICIENT_KAN_HIDDEN_SWEEP_VALUES = [64, 96, 128, 192]
-    EFFICIENT_KAN_LR_SWEEP_VALUES = [5e-4, 1e-3]
+    EFFICIENT_KAN_LR_SWEEP_VALUES = [1e-3]
     EFFICIENT_KAN_GRID_SWEEP_VALUES = [4, 8, 12, 16]
     EFFICIENT_KAN_ORDER_SWEEP_VALUES = [1, 2, 3, 4]
     EFFICIENT_KAN_LAYER_SWEEP_VALUES = [1, 2, 3]
@@ -1777,17 +1778,22 @@ def discover_symbol_files() -> Tuple[Path, List[int]]:
 
 
 def resolve_splits(file_indices: List[int]) -> Tuple[List[int], List[int], List[int]]:
-    train_files = max(1, int(len(file_indices) * Config.TRAIN_PORTION))
-    if train_files >= len(file_indices):
-        train_files = len(file_indices) - 1
-    train_pool = file_indices[:train_files]
-    if len(train_pool) < 2:
-        raise ValueError("Need at least 2 train files so one can be held out for validation.")
-    train_idx = train_pool[:-1]
-    val_idx = [train_pool[-1]]
-    test_idx = file_indices[train_files:]
+    train_val_files = max(2, int(len(file_indices) * Config.TRAIN_PORTION))
+    if train_val_files >= len(file_indices):
+        train_val_files = len(file_indices) - 1
+    train_val_pool = file_indices[:train_val_files]
+    if len(train_val_pool) < 2:
+        raise ValueError("Need at least 2 train+val files so validation can be held out.")
+
+    requested_val_files = int(round(len(train_val_pool) * Config.VAL_PORTION_WITHIN_TRAIN))
+    val_files = max(Config.MIN_VAL_FILES, requested_val_files)
+    val_files = min(max(val_files, 1), len(train_val_pool) - 1)
+
+    train_idx = train_val_pool[:-val_files]
+    val_idx = train_val_pool[-val_files:]
+    test_idx = file_indices[train_val_files:]
     if not test_idx:
-        raise ValueError("MXNet-style split produced no test files. Increase MAX_FILES.")
+        raise ValueError("File-level split produced no test files. Increase MAX_FILES or lower TRAIN_PORTION.")
     return train_idx, val_idx, test_idx
 
 
@@ -1819,6 +1825,10 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         if not test_idx:
             raise ValueError("max_test_files truncated test split to zero files.")
     log(f"Data dir: {base_dir}")
+    log(
+        "Split protocol: train/val/test are separated by file; "
+        "test files are never used for fitting, checkpoint selection, or normalization statistics."
+    )
     log(f"Train files: {train_idx}")
     log(f"Val files: {val_idx}")
     log(f"Test files: {test_idx}")
@@ -1826,13 +1836,11 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
     tx_train, rx_train = load_files(base_dir, train_idx)
     tx_val, rx_val = load_files(base_dir, val_idx)
     tx_test, rx_test = load_files(base_dir, test_idx)
-    tx_all, rx_all = load_files(base_dir, all_indices)
 
     if Config.POWER_NORMALIZE:
         tx_train, rx_train, tx_scale, rx_scale = power_normalize_pair(tx_train, rx_train)
         tx_val, rx_val, _, _ = power_normalize_pair(tx_val, rx_val, tx_scale=tx_scale, rx_scale=rx_scale)
         tx_test, rx_test, _, _ = power_normalize_pair(tx_test, rx_test, tx_scale=tx_scale, rx_scale=rx_scale)
-        tx_all, rx_all, _, _ = power_normalize_pair(tx_all, rx_all, tx_scale=tx_scale, rx_scale=rx_scale)
     else:
         tx_scale = torch.tensor(1.0, dtype=tx_train.dtype)
         rx_scale = torch.tensor(1.0, dtype=rx_train.dtype)
@@ -1844,11 +1852,8 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
     train_x, train_y = make_windows(rx_train, tx_train, mean, std)
     val_x, val_y = make_windows(rx_val, tx_val, mean, std)
     test_x, test_y = make_windows(rx_test, tx_test, mean, std)
-    all_x, all_y = make_windows(rx_all, tx_all, mean, std)
     rx_test_center = rx_test[Config.CONTEXT_K : rx_test.size(0) - Config.CONTEXT_K].contiguous()
     tx_test_center = tx_test[Config.CONTEXT_K : tx_test.size(0) - Config.CONTEXT_K].contiguous()
-    rx_all_center = rx_all[Config.CONTEXT_K : rx_all.size(0) - Config.CONTEXT_K].contiguous()
-    tx_all_center = tx_all[Config.CONTEXT_K : tx_all.size(0) - Config.CONTEXT_K].contiguous()
 
     return {
         "train_x": train_x,
@@ -1857,16 +1862,10 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         "val_y": val_y,
         "test_x": test_x,
         "test_y": test_y,
-        "all_x": all_x,
-        "all_y": all_y,
         "tx_test": tx_test,
         "rx_test": rx_test,
         "tx_test_center": tx_test_center,
         "rx_test_center": rx_test_center,
-        "tx_all": tx_all,
-        "rx_all": rx_all,
-        "tx_all_center": tx_all_center,
-        "rx_all_center": rx_all_center,
         "mean": mean,
         "std": std,
         "tx_scale": tx_scale,
@@ -1989,7 +1988,7 @@ def evaluate_split(
 
 @torch.inference_mode()
 def compute_test_metrics(model: nn.Module, data: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    eval_prefix = "all" if Config.EVAL_ON_ALL_FILES else "test"
+    eval_prefix = "test"
     baseline_scale = find_best_symbol_scale(data[f"tx_{eval_prefix}_center"], data[f"rx_{eval_prefix}_center"])
     tx_cls = symbols_to_classes(data[f"tx_{eval_prefix}_center"].to(Config.DEVICE))
     rx_cls = symbols_to_classes((data[f"rx_{eval_prefix}_center"] * baseline_scale).to(Config.DEVICE))
@@ -1999,6 +1998,7 @@ def compute_test_metrics(model: nn.Module, data: Dict[str, torch.Tensor]) -> Dic
         model, data[f"{eval_prefix}_x"], data[f"{eval_prefix}_y"], eval_batch_size, scale_search=True
     )
     return {
+        "eval_split": eval_prefix,
         "baseline_ber": baseline_ber,
         "baseline_scale": baseline_scale,
         "equalized_ber": test_ber,
@@ -2518,7 +2518,10 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         history["epoch_time_sec"].append(epoch_time)
         history["train_samples_per_sec"].append(speed)
 
-        if (epoch + 1) % Config.TEST_BER_EVERY == 0 or epoch == 0 or epoch == Config.EPOCHS - 1:
+        should_eval_test = Config.EVAL_TEST_DURING_TRAINING and (
+            (epoch + 1) % Config.TEST_BER_EVERY == 0 or epoch == 0 or epoch == Config.EPOCHS - 1
+        )
+        if should_eval_test:
             test_metrics = compute_test_metrics(model, {**data, "eval_batch_size": eval_batch_size})
             eval_batch_size = int(test_metrics["safe_eval_batch_size"])
             history["test_loss"].append(test_metrics["test_loss"])
@@ -2532,7 +2535,7 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
                 f"test_ber {test_metrics['equalized_ber']:.6e} | lr {optimizer.param_groups[0]['lr']:.2e} | "
                 f"speed {speed:,.0f} samp/s | time {epoch_time:.1f}s"
             )
-        elif epoch % Config.LOG_EVERY == 0:
+        elif epoch % Config.LOG_EVERY == 0 or epoch == Config.EPOCHS - 1:
             log(
                 f"{model_name} | epoch {epoch+1:4d}/{Config.EPOCHS} | "
                 f"train {train_loss:.6f} | val {val_loss:.6f} | val_ber {val_ber:.6e} | "
