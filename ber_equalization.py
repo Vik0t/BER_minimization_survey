@@ -126,20 +126,28 @@ class Config:
     BER_SCALE_SAMPLES = 1 << 20
 
     OUT_DIR = Path("clean_compare_outputs")
+    RUN_MAIN_EXPERIMENTS = False
     MODEL_TYPES = [
         "efficient_kan_baseline",
-        "efficient_kan_residual",
-        "efficient_kan_features",
+        "efficient_kan_residual",   
         "cnn_kan",
         "kan_classifier",
-        "mlp",
-        "cnn",
+    
     ]
     SAVE_BEST = True
-    RUN_SWEEP_EXPERIMENTS = False
+    RUN_SWEEP_EXPERIMENTS = True
     SWEEP_TEST_FILES = 1
     WINDOW_SWEEP_VALUES = [2, 4, 8, 12, 16, 20]
     HIDDEN_SWEEP_VALUES = [8, 16, 32, 64]
+    RUN_EFFICIENT_KAN_SWEEP = True
+    EFFICIENT_KAN_SWEEP_MODELS = ["efficient_kan_baseline", "kan_classifier"]
+    EFFICIENT_KAN_SWEEP_EPOCHS = 60
+    EFFICIENT_KAN_SWEEP_TEST_FILES = 1
+    EFFICIENT_KAN_HIDDEN_SWEEP_VALUES = [64, 96, 128, 192]
+    EFFICIENT_KAN_LR_SWEEP_VALUES = [5e-4, 1e-3]
+    EFFICIENT_KAN_GRID_SWEEP_VALUES = [4, 8, 12, 16]
+    EFFICIENT_KAN_ORDER_SWEEP_VALUES = [1, 2, 3, 4]
+    EFFICIENT_KAN_LAYER_SWEEP_VALUES = [1, 2, 3]
 
 
 if Config.DEVICE.type == "cuda":
@@ -2133,6 +2141,42 @@ def plot_sweep_overlay(df: pd.DataFrame, x_col: str, x_label: str, filename: str
     plt.close(fig)
 
 
+def plot_efficient_kan_sweep(df: pd.DataFrame, x_col: str, x_label: str, filename: str, title: str):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for model_name in Config.EFFICIENT_KAN_SWEEP_MODELS:
+        model_df = df[df["model_type"] == model_name].sort_values(x_col)
+        if model_df.empty:
+            continue
+        ax.plot(model_df[x_col], model_df["equalized_ber"], marker="o", linewidth=2, label=model_name)
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("BER")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_efficient_kan_tradeoff(df: pd.DataFrame, x_col: str, x_label: str, filename: str, title: str):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for model_name in Config.EFFICIENT_KAN_SWEEP_MODELS:
+        model_df = df[df["model_type"] == model_name]
+        if model_df.empty:
+            continue
+        ax.scatter(model_df[x_col], model_df["equalized_ber"], s=60, label=model_name)
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("BER")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) -> Dict[str, float]:
     tracked_keys = [
         "CONTEXT_K",
@@ -2140,6 +2184,12 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
         "HIDDEN_DIM",
         "LSTM_HIDDEN",
         "SAVE_BEST",
+        "EPOCHS",
+        "LEARNING_RATE",
+        "EFFICIENT_KAN_HIDDEN_DIM",
+        "EFFICIENT_KAN_LAYERS",
+        "EFFICIENT_KAN_GRID_SIZE",
+        "EFFICIENT_KAN_SPLINE_ORDER",
     ]
     previous = {key: getattr(Config, key) for key in tracked_keys}
     try:
@@ -2160,6 +2210,10 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
 
 
 def run_sweep_experiments():
+    if Config.RUN_EFFICIENT_KAN_SWEEP:
+        run_efficient_kan_sweep_experiments()
+        return
+
     log("\nRunning BER sweep experiments on one test file...")
     window_rows: List[Dict[str, float]] = []
     hidden_rows: List[Dict[str, float]] = []
@@ -2208,10 +2262,136 @@ def run_sweep_experiments():
     plot_sweep_overlay(hidden_df, x_col="hidden_size", x_label="Hidden Size", filename="ber_vs_hidden_overlay.png")
 
 
+def run_efficient_kan_sweep_experiments():
+    log("\nRunning EfficientKAN regression/classifier sweep...")
+    rows: List[Dict[str, float]] = []
+    base = {
+        "EPOCHS": Config.EFFICIENT_KAN_SWEEP_EPOCHS,
+        "EFFICIENT_KAN_HIDDEN_DIM": Config.EFFICIENT_KAN_HIDDEN_DIM,
+        "EFFICIENT_KAN_LAYERS": Config.EFFICIENT_KAN_LAYERS,
+        "EFFICIENT_KAN_GRID_SIZE": Config.EFFICIENT_KAN_GRID_SIZE,
+        "EFFICIENT_KAN_SPLINE_ORDER": Config.EFFICIENT_KAN_SPLINE_ORDER,
+        "LEARNING_RATE": Config.LEARNING_RATE,
+    }
+
+    def run_case(sweep_name: str, model_name: str, **overrides):
+        effective = {**base, **overrides}
+        case_id = (
+            f"{sweep_name}_{model_name}_"
+            f"h{effective['EFFICIENT_KAN_HIDDEN_DIM']}_"
+            f"l{effective['EFFICIENT_KAN_LAYERS']}_"
+            f"g{effective['EFFICIENT_KAN_GRID_SIZE']}_"
+            f"o{effective['EFFICIENT_KAN_SPLINE_ORDER']}_"
+            f"lr{effective['LEARNING_RATE']:.0e}"
+        )
+        log(f"sweep | {case_id}")
+        results = run_model_with_overrides(
+            model_name,
+            max_test_files=Config.EFFICIENT_KAN_SWEEP_TEST_FILES,
+            **effective,
+        )
+        row = {
+            "case_id": case_id,
+            "sweep": sweep_name,
+            "model_type": model_name,
+            "hidden_dim": effective["EFFICIENT_KAN_HIDDEN_DIM"],
+            "layers": effective["EFFICIENT_KAN_LAYERS"],
+            "grid_size": effective["EFFICIENT_KAN_GRID_SIZE"],
+            "spline_order": effective["EFFICIENT_KAN_SPLINE_ORDER"],
+            "learning_rate": effective["LEARNING_RATE"],
+            "epochs": effective["EPOCHS"],
+            **results,
+        }
+        rows.append(row)
+        pd.DataFrame(rows).to_csv(Config.OUT_DIR / "efficient_kan_sweep_all.csv", index=False)
+
+    for model_name in Config.EFFICIENT_KAN_SWEEP_MODELS:
+        for hidden_dim in Config.EFFICIENT_KAN_HIDDEN_SWEEP_VALUES:
+            for learning_rate in Config.EFFICIENT_KAN_LR_SWEEP_VALUES:
+                run_case(
+                    "hidden_lr",
+                    model_name,
+                    EFFICIENT_KAN_HIDDEN_DIM=hidden_dim,
+                    LEARNING_RATE=learning_rate,
+                )
+
+        for grid_size in Config.EFFICIENT_KAN_GRID_SWEEP_VALUES:
+            run_case("grid_size", model_name, EFFICIENT_KAN_GRID_SIZE=grid_size)
+
+        for spline_order in Config.EFFICIENT_KAN_ORDER_SWEEP_VALUES:
+            run_case("spline_order", model_name, EFFICIENT_KAN_SPLINE_ORDER=spline_order)
+
+        for layers in Config.EFFICIENT_KAN_LAYER_SWEEP_VALUES:
+            run_case("layers", model_name, EFFICIENT_KAN_LAYERS=layers)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(Config.OUT_DIR / "efficient_kan_sweep_all.csv", index=False)
+
+    hidden_df = df[df["sweep"] == "hidden_lr"].copy()
+    grid_df = df[df["sweep"] == "grid_size"].copy()
+    order_df = df[df["sweep"] == "spline_order"].copy()
+    layer_df = df[df["sweep"] == "layers"].copy()
+
+    hidden_df.to_csv(Config.OUT_DIR / "efficient_kan_ber_vs_hidden_lr.csv", index=False)
+    grid_df.to_csv(Config.OUT_DIR / "efficient_kan_ber_vs_grid.csv", index=False)
+    order_df.to_csv(Config.OUT_DIR / "efficient_kan_ber_vs_order.csv", index=False)
+    layer_df.to_csv(Config.OUT_DIR / "efficient_kan_ber_vs_layers.csv", index=False)
+
+    for learning_rate in Config.EFFICIENT_KAN_LR_SWEEP_VALUES:
+        lr_df = hidden_df[hidden_df["learning_rate"] == learning_rate]
+        if lr_df.empty:
+            continue
+        plot_efficient_kan_sweep(
+            lr_df,
+            x_col="hidden_dim",
+            x_label="EfficientKAN Hidden Dimension",
+            filename=f"efficient_kan_ber_vs_hidden_lr_{learning_rate:.0e}.png",
+            title=f"EfficientKAN BER vs Hidden Dim (lr={learning_rate:.0e})",
+        )
+
+    plot_efficient_kan_sweep(
+        grid_df,
+        x_col="grid_size",
+        x_label="Grid Size",
+        filename="efficient_kan_ber_vs_grid.png",
+        title="EfficientKAN BER vs Grid Size",
+    )
+    plot_efficient_kan_sweep(
+        order_df,
+        x_col="spline_order",
+        x_label="Spline Order",
+        filename="efficient_kan_ber_vs_spline_order.png",
+        title="EfficientKAN BER vs Spline Order",
+    )
+    plot_efficient_kan_sweep(
+        layer_df,
+        x_col="layers",
+        x_label="KAN Hidden Layers",
+        filename="efficient_kan_ber_vs_layers.png",
+        title="EfficientKAN BER vs Number of Layers",
+    )
+    plot_efficient_kan_tradeoff(
+        df,
+        x_col="trainable_params",
+        x_label="Trainable Parameters",
+        filename="efficient_kan_params_vs_ber.png",
+        title="EfficientKAN Parameter Count vs BER",
+    )
+    plot_efficient_kan_tradeoff(
+        df,
+        x_col="train_samples_per_sec",
+        x_label="Training Samples/sec",
+        filename="efficient_kan_speed_vs_ber.png",
+        title="EfficientKAN Training Speed vs BER",
+    )
+    log(f"Saved EfficientKAN sweep: {Config.OUT_DIR / 'efficient_kan_sweep_all.csv'}")
+
+
 def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
     model = make_model(model_name)
+    trainable_params = count_trainable_parameters(model)
     log(
-        f"{model_name} | params {count_trainable_parameters(model):,} | "
+        f"{model_name} | params {trainable_params:,} | "
         f"{MODEL_NOTES.get(model_name, 'custom equalizer')}"
     )
     if hasattr(model, "initialize_from_data"):
@@ -2394,12 +2574,22 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     final_metrics = compute_test_metrics(model, {**data, "eval_batch_size": eval_batch_size})
+    final_metrics["trainable_params"] = trainable_params
+    final_metrics["best_val_ber"] = best_val_ber
+    final_metrics["best_train_loss"] = best_train_loss
+    final_metrics["train_samples_per_sec"] = float(np.mean(history["train_samples_per_sec"])) if history["train_samples_per_sec"] else 0.0
+    final_metrics["mean_epoch_time_sec"] = float(np.mean(history["epoch_time_sec"])) if history["epoch_time_sec"] else 0.0
     return model, history, final_metrics
 
 
 def main():
     Config.OUT_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Device: {Config.DEVICE}")
+
+    if Config.RUN_SWEEP_EXPERIMENTS and not Config.RUN_MAIN_EXPERIMENTS:
+        run_sweep_experiments()
+        return
+
     data = prepare_data()
 
     all_results = []
