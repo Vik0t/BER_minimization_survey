@@ -798,3 +798,106 @@ Interpretation for future comparisons:
 Old reported test curves should be treated carefully if they were produced with EVAL_ON_ALL_FILES=True.
 New runs are stricter and should be compared primarily by best_val_ber and final hold-out equalized_ber.
 ```
+
+### 2026-05-16: Early stopping and split randomization option
+
+Updated `ber_equalization.py` training protocol:
+
+```text
+EARLY_STOPPING = True
+EARLY_STOPPING_PATIENCE = 72
+EARLY_STOPPING_MIN_EPOCHS = 40
+EARLY_STOPPING_THRESHOLD = 0.0
+```
+
+Early stopping is based on `val_ber`, independently from the LR scheduler. The scheduler can still reduce LR every `DECAY_STEPS`, but training stops if validation BER does not improve for the configured patience window.
+
+Also added an optional reproducible file split randomization:
+
+```text
+RANDOMIZE_FILE_SPLIT = False
+SPLIT_SEED = 42
+```
+
+Default is kept deterministic/chronological for continuity. For robustness experiments, enable `RANDOMIZE_FILE_SPLIT=True` and run several `SPLIT_SEED` values. This directly tests the concern that one validation file can be unusually noisy or unusually easy.
+
+### 2026-05-17: Per-file windows and per-file BER diagnostics
+
+Updated `ber_equalization.py` to avoid artificial context windows across CSV file boundaries.
+
+Previous risk:
+
+```text
+load_files() concatenated several files
+make_windows() then unfolded across the concatenated tensor
+```
+
+That creates invalid windows at file boundaries: part of the context comes from one file and part from the next file.
+
+New behavior:
+
+```text
+1. Each CSV is loaded separately.
+2. Power normalization still uses train files only.
+3. Mean/std normalization still uses train files only.
+4. Context windows are built separately inside each file.
+5. File windows are concatenated only after window construction.
+```
+
+Added final per-file diagnostics:
+
+```text
+val_file_equalized_ber_mean/std/worst
+test_file_equalized_ber_mean/std/worst
+val_file_equalized_ber_by_file
+test_file_equalized_ber_by_file
+```
+
+Also reduced the default training block/batch size:
+
+```text
+TRAIN_BLOCK_SIZE = 8192
+```
+
+Rationale: smaller stochastic batches may generalize better than very large batches while still being GPU-friendly.
+
+### 2026-05-19: Experiment suite for KAN/MLP figures
+
+Prepared `ber_equalization.py` for the planned experiment figures.
+
+New switch:
+
+```text
+RUN_KAN_EXPERIMENT_SUITE = True
+```
+
+When enabled, it runs a dedicated suite and saves:
+
+```text
+kan_experiment_suite_all.csv
+ber_vs_grid.csv / ber_vs_grid.png
+ber_vs_spline_order.csv / ber_vs_spline_order.png
+kan_mlp_vs_hidden_grid16.csv / kan_mlp_ber_vs_hidden_grid16.png
+kan_mlp_vs_window.csv / kan_mlp_ber_vs_window.png
+kan_mlp_vs_layers.csv / kan_mlp_ber_vs_layers.png
+ber_vs_complexity.csv / ber_vs_complexity.png
+```
+
+Experiment defaults:
+
+```text
+EXPERIMENT_FIXED_GRID = 16
+EXPERIMENT_FIXED_SPLINE_ORDER = 3
+EXPERIMENT_HIDDEN_VALUES = [64, 96, 128, 192]
+EXPERIMENT_WINDOW_VALUES = [8, 16, 24, 32, 48]
+EXPERIMENT_GRID_VALUES = [4, 8, 12, 16, 20]
+EXPERIMENT_SPLINE_ORDER_VALUES = [1, 2, 3, 4]
+EXPERIMENT_LAYER_VALUES = [1, 2, 3]
+```
+
+Important implementation detail:
+
+```text
+MLP_LAYERS was added so MLP can be swept by number of layers.
+For KAN vs MLP hidden/layer sweeps, the suite applies comparable hidden/layer overrides to both model families.
+```

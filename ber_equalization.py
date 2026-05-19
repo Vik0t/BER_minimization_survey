@@ -1,7 +1,7 @@
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,6 +27,8 @@ class Config:
     TRAIN_PORTION = 0.97
     VAL_PORTION_WITHIN_TRAIN = 0.10
     MIN_VAL_FILES = 1
+    RANDOMIZE_FILE_SPLIT = False
+    SPLIT_SEED = 42
 
     CONTEXT_K = 32
     SEQ_LEN = 2 * CONTEXT_K + 1
@@ -100,7 +102,7 @@ class Config:
     EPOCHS = 250
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 0.0
-    TRAIN_BLOCK_SIZE = 16384
+    TRAIN_BLOCK_SIZE = 8192
     EVAL_BATCH_SIZE = 65536
     MIN_BLOCK_SIZE = 1024
     USE_AMP = True
@@ -116,10 +118,15 @@ class Config:
 
     DECAY_STEPS = 24
     MIN_LR = 1e-5
+    EARLY_STOPPING = True
+    EARLY_STOPPING_PATIENCE = 72
+    EARLY_STOPPING_MIN_EPOCHS = 40
+    EARLY_STOPPING_THRESHOLD = 0.0
     LOG_EVERY = 1
     TEST_BER_EVERY = 10
     SAVE_BEST_BY = "val_ber"
     EVAL_TEST_DURING_TRAINING = False
+    COMPUTE_PER_FILE_METRICS = True
     POWER_NORMALIZE = True
     BER_SCALE_SEARCH = True
     BER_SCALE_MIN = 0.5
@@ -149,6 +156,22 @@ class Config:
     EFFICIENT_KAN_GRID_SWEEP_VALUES = [4, 8, 12, 16]
     EFFICIENT_KAN_ORDER_SWEEP_VALUES = [1, 2, 3, 4]
     EFFICIENT_KAN_LAYER_SWEEP_VALUES = [1, 2, 3]
+
+    RUN_KAN_EXPERIMENT_SUITE = False
+    EXPERIMENT_EPOCHS = 60
+    EXPERIMENT_TEST_FILES = 1
+    EXPERIMENT_COMPUTE_PER_FILE_METRICS = False
+    EXPERIMENT_KAN_MODELS = ["efficient_kan_baseline", "kan_classifier"]
+    EXPERIMENT_COMPARE_MODELS = ["efficient_kan_baseline", "mlp"]
+    EXPERIMENT_COMPLEXITY_MODELS = ["complex_fastkan", "efficient_kan_baseline"]
+    EXPERIMENT_FIXED_GRID = 16
+    EXPERIMENT_FIXED_SPLINE_ORDER = 3
+    EXPERIMENT_HIDDEN_VALUES = [64, 96, 128, 192]
+    EXPERIMENT_WINDOW_VALUES = [8, 16, 24, 32, 48]
+    EXPERIMENT_GRID_VALUES = [4, 8, 12, 16, 20]
+    EXPERIMENT_SPLINE_ORDER_VALUES = [1, 2, 3, 4]
+    EXPERIMENT_LAYER_VALUES = [1, 2, 3]
+    MLP_LAYERS = 3
 
 
 if Config.DEVICE.type == "cuda":
@@ -1508,18 +1531,19 @@ class MLPRxEqualizer(nn.Module):
         input_dim = Config.SEQ_LEN * Config.INPUT_DIM
         hidden_dim = Config.HIDDEN_DIM
         self.skip = nn.Linear(input_dim, 2)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, Config.HIDDEN_DIM),
-            nn.LayerNorm(Config.HIDDEN_DIM),
-            nn.GELU(),
-            nn.Linear(Config.HIDDEN_DIM, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 2),
-        )
+        layers: List[nn.Module] = []
+        in_dim = input_dim
+        for _ in range(max(Config.MLP_LAYERS, 1)):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                ]
+            )
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 2))
+        self.net = nn.Sequential(*layers)
         self._init_weights()
 
     def _init_weights(self):
@@ -1778,6 +1802,11 @@ def discover_symbol_files() -> Tuple[Path, List[int]]:
 
 
 def resolve_splits(file_indices: List[int]) -> Tuple[List[int], List[int], List[int]]:
+    file_indices = list(file_indices)
+    if Config.RANDOMIZE_FILE_SPLIT:
+        rng = np.random.default_rng(Config.SPLIT_SEED)
+        file_indices = rng.permutation(file_indices).tolist()
+
     train_val_files = max(2, int(len(file_indices) * Config.TRAIN_PORTION))
     if train_val_files >= len(file_indices):
         train_val_files = len(file_indices) - 1
@@ -1797,15 +1826,43 @@ def resolve_splits(file_indices: List[int]) -> Tuple[List[int], List[int], List[
     return train_idx, val_idx, test_idx
 
 
+def load_symbol_file(base_dir: Path, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    path = base_dir / f"Symbols_1m_1ch_PR_{idx}.csv"
+    arr = pd.read_csv(path, header=None, dtype=np.float32).to_numpy(copy=False)
+    return torch.from_numpy(arr[:, 0:2].copy()), torch.from_numpy(arr[:, 2:4].copy())
+
+
 def load_files(base_dir: Path, file_indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     tx_list: List[torch.Tensor] = []
     rx_list: List[torch.Tensor] = []
     for idx in file_indices:
-        path = base_dir / f"Symbols_1m_1ch_PR_{idx}.csv"
-        arr = pd.read_csv(path, header=None, dtype=np.float32).to_numpy(copy=False)
-        tx_list.append(torch.from_numpy(arr[:, 0:2].copy()))
-        rx_list.append(torch.from_numpy(arr[:, 2:4].copy()))
+        tx_symbols, rx_symbols = load_symbol_file(base_dir, idx)
+        tx_list.append(tx_symbols)
+        rx_list.append(rx_symbols)
     return torch.cat(tx_list, dim=0), torch.cat(rx_list, dim=0)
+
+
+def load_file_splits(base_dir: Path, file_indices: List[int]) -> List[Dict[str, Any]]:
+    files: List[Dict[str, Any]] = []
+    for idx in file_indices:
+        tx_symbols, rx_symbols = load_symbol_file(base_dir, idx)
+        files.append({"file_idx": idx, "tx": tx_symbols, "rx": rx_symbols})
+    return files
+
+
+def normalize_file_splits(
+    files: List[Dict[str, Any]],
+    tx_scale: torch.Tensor,
+    rx_scale: torch.Tensor,
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "file_idx": item["file_idx"],
+            "tx": item["tx"] / tx_scale,
+            "rx": item["rx"] / rx_scale,
+        }
+        for item in files
+    ]
 
 
 def make_windows(rx_symbols: torch.Tensor, tx_symbols: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1817,7 +1874,44 @@ def make_windows(rx_symbols: torch.Tensor, tx_symbols: torch.Tensor, mean: torch
     return x, y
 
 
-def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor]:
+def make_windows_for_files(
+    files: List[Dict[str, Any]],
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    collect_spans: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]]]:
+    x_parts: List[torch.Tensor] = []
+    y_parts: List[torch.Tensor] = []
+    file_spans: List[Dict[str, Any]] = []
+    offset = 0
+
+    for item in files:
+        tx_symbols = item["tx"]
+        rx_symbols = item["rx"]
+        if rx_symbols.size(0) < Config.SEQ_LEN:
+            continue
+        x_file, y_file = make_windows(rx_symbols, tx_symbols, mean, std)
+        count = x_file.size(0)
+        if collect_spans:
+            file_spans.append(
+                {
+                    "file_idx": item["file_idx"],
+                    "start": offset,
+                    "end": offset + count,
+                    "tx_center": tx_symbols[Config.CONTEXT_K : tx_symbols.size(0) - Config.CONTEXT_K].contiguous(),
+                    "rx_center": rx_symbols[Config.CONTEXT_K : rx_symbols.size(0) - Config.CONTEXT_K].contiguous(),
+                }
+            )
+        x_parts.append(x_file)
+        y_parts.append(y_file)
+        offset += count
+
+    if not x_parts:
+        raise ValueError("No file is long enough to build context windows.")
+    return torch.cat(x_parts, dim=0), torch.cat(y_parts, dim=0), file_spans
+
+
+def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, Any]:
     base_dir, all_indices = discover_symbol_files()
     train_idx, val_idx, test_idx = resolve_splits(all_indices)
     if max_test_files is not None:
@@ -1829,31 +1923,45 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         "Split protocol: train/val/test are separated by file; "
         "test files are never used for fitting, checkpoint selection, or normalization statistics."
     )
+    if Config.RANDOMIZE_FILE_SPLIT:
+        log(f"File split randomized with SPLIT_SEED={Config.SPLIT_SEED}")
     log(f"Train files: {train_idx}")
     log(f"Val files: {val_idx}")
     log(f"Test files: {test_idx}")
 
-    tx_train, rx_train = load_files(base_dir, train_idx)
-    tx_val, rx_val = load_files(base_dir, val_idx)
-    tx_test, rx_test = load_files(base_dir, test_idx)
+    train_files = load_file_splits(base_dir, train_idx)
+    val_files = load_file_splits(base_dir, val_idx)
+    test_files = load_file_splits(base_dir, test_idx)
+    tx_train_raw = torch.cat([item["tx"] for item in train_files], dim=0)
+    rx_train_raw = torch.cat([item["rx"] for item in train_files], dim=0)
 
     if Config.POWER_NORMALIZE:
-        tx_train, rx_train, tx_scale, rx_scale = power_normalize_pair(tx_train, rx_train)
-        tx_val, rx_val, _, _ = power_normalize_pair(tx_val, rx_val, tx_scale=tx_scale, rx_scale=rx_scale)
-        tx_test, rx_test, _, _ = power_normalize_pair(tx_test, rx_test, tx_scale=tx_scale, rx_scale=rx_scale)
+        _, _, tx_scale, rx_scale = power_normalize_pair(tx_train_raw, rx_train_raw)
     else:
-        tx_scale = torch.tensor(1.0, dtype=tx_train.dtype)
-        rx_scale = torch.tensor(1.0, dtype=rx_train.dtype)
+        tx_scale = torch.tensor(1.0, dtype=tx_train_raw.dtype)
+        rx_scale = torch.tensor(1.0, dtype=rx_train_raw.dtype)
+
+    train_files = normalize_file_splits(train_files, tx_scale, rx_scale)
+    val_files = normalize_file_splits(val_files, tx_scale, rx_scale)
+    test_files = normalize_file_splits(test_files, tx_scale, rx_scale)
+    tx_train = torch.cat([item["tx"] for item in train_files], dim=0)
+    rx_train = torch.cat([item["rx"] for item in train_files], dim=0)
+    tx_test = torch.cat([item["tx"] for item in test_files], dim=0)
+    rx_test = torch.cat([item["rx"] for item in test_files], dim=0)
 
     mean = rx_train.mean(dim=0, keepdim=True)
     std = rx_train.std(dim=0, keepdim=True)
     std[std == 0] = 1.0
 
-    train_x, train_y = make_windows(rx_train, tx_train, mean, std)
-    val_x, val_y = make_windows(rx_val, tx_val, mean, std)
-    test_x, test_y = make_windows(rx_test, tx_test, mean, std)
-    rx_test_center = rx_test[Config.CONTEXT_K : rx_test.size(0) - Config.CONTEXT_K].contiguous()
-    tx_test_center = tx_test[Config.CONTEXT_K : tx_test.size(0) - Config.CONTEXT_K].contiguous()
+    train_x, train_y, _ = make_windows_for_files(train_files, mean, std, collect_spans=False)
+    val_x, val_y, val_file_spans = make_windows_for_files(val_files, mean, std)
+    test_x, test_y, test_file_spans = make_windows_for_files(test_files, mean, std)
+    log(
+        "Window samples (built per file, no cross-file context): "
+        f"train {train_x.size(0):,} | val {val_x.size(0):,} | test {test_x.size(0):,}"
+    )
+    rx_test_center = torch.cat([item["rx_center"] for item in test_file_spans], dim=0)
+    tx_test_center = torch.cat([item["tx_center"] for item in test_file_spans], dim=0)
 
     return {
         "train_x": train_x,
@@ -1862,6 +1970,8 @@ def prepare_data(max_test_files: Optional[int] = None) -> Dict[str, torch.Tensor
         "val_y": val_y,
         "test_x": test_x,
         "test_y": test_y,
+        "val_file_spans": val_file_spans,
+        "test_file_spans": test_file_spans,
         "tx_test": tx_test,
         "rx_test": rx_test,
         "tx_test_center": tx_test_center,
@@ -1987,7 +2097,70 @@ def evaluate_split(
 
 
 @torch.inference_mode()
-def compute_test_metrics(model: nn.Module, data: Dict[str, torch.Tensor]) -> Dict[str, float]:
+def compute_split_file_metrics(
+    model: nn.Module,
+    data: Dict[str, Any],
+    split: str,
+    batch_size: int,
+) -> Tuple[List[Dict[str, float]], int]:
+    file_spans = data.get(f"{split}_file_spans", [])
+    if not file_spans:
+        return [], batch_size
+
+    results: List[Dict[str, float]] = []
+    current_batch_size = batch_size
+    x = data[f"{split}_x"]
+    y = data[f"{split}_y"]
+    for item in file_spans:
+        start = int(item["start"])
+        end = int(item["end"])
+        baseline_scale = find_best_symbol_scale(item["tx_center"], item["rx_center"])
+        tx_cls = symbols_to_classes(item["tx_center"].to(Config.DEVICE))
+        rx_cls = symbols_to_classes((item["rx_center"] * baseline_scale).to(Config.DEVICE))
+        baseline_ber = calculate_ber_from_classes(tx_cls, rx_cls)
+        loss, acc, ber, current_batch_size, equalizer_scale = evaluate_split(
+            model,
+            x[start:end],
+            y[start:end],
+            current_batch_size,
+            scale_search=True,
+        )
+        results.append(
+            {
+                "file_idx": int(item["file_idx"]),
+                "samples": int(end - start),
+                "baseline_ber": float(baseline_ber),
+                "baseline_scale": float(baseline_scale),
+                "equalized_ber": float(ber),
+                "equalizer_scale": float(equalizer_scale),
+                "accuracy": float(acc),
+                "loss": float(loss),
+                "improvement_rel": float((1 - ber / baseline_ber) * 100 if baseline_ber > 0 else 0.0),
+            }
+        )
+    return results, current_batch_size
+
+
+def add_file_metric_summary(metrics: Dict[str, Any], split: str, file_metrics: List[Dict[str, float]]):
+    if not file_metrics:
+        return
+    equalized = np.array([row["equalized_ber"] for row in file_metrics], dtype=np.float64)
+    baseline = np.array([row["baseline_ber"] for row in file_metrics], dtype=np.float64)
+    metrics[f"{split}_file_equalized_ber_mean"] = float(equalized.mean())
+    metrics[f"{split}_file_equalized_ber_std"] = float(equalized.std())
+    metrics[f"{split}_file_equalized_ber_worst"] = float(equalized.max())
+    metrics[f"{split}_file_baseline_ber_mean"] = float(baseline.mean())
+    metrics[f"{split}_file_baseline_ber_worst"] = float(baseline.max())
+    metrics[f"{split}_file_equalized_ber_by_file"] = ";".join(
+        f"{int(row['file_idx'])}:{row['equalized_ber']:.6e}" for row in file_metrics
+    )
+    metrics[f"{split}_file_baseline_ber_by_file"] = ";".join(
+        f"{int(row['file_idx'])}:{row['baseline_ber']:.6e}" for row in file_metrics
+    )
+
+
+@torch.inference_mode()
+def compute_test_metrics(model: nn.Module, data: Dict[str, Any]) -> Dict[str, Any]:
     eval_prefix = "test"
     baseline_scale = find_best_symbol_scale(data[f"tx_{eval_prefix}_center"], data[f"rx_{eval_prefix}_center"])
     tx_cls = symbols_to_classes(data[f"tx_{eval_prefix}_center"].to(Config.DEVICE))
@@ -2177,7 +2350,69 @@ def plot_efficient_kan_tradeoff(df: pd.DataFrame, x_col: str, x_label: str, file
     plt.close(fig)
 
 
-def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) -> Dict[str, float]:
+def plot_experiment_lines(
+    df: pd.DataFrame,
+    x_col: str,
+    x_label: str,
+    filename: str,
+    title: str,
+    y_col: str = "equalized_ber",
+):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for model_name, model_df in df.groupby("model_type"):
+        model_df = model_df.sort_values(x_col)
+        ax.plot(model_df[x_col], model_df[y_col], marker="o", linewidth=2, label=model_name)
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("BER")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_experiment_complexity(df: pd.DataFrame, filename: str, title: str):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for model_name, model_df in df.groupby("model_type"):
+        ax.plot(
+            model_df["trainable_params"],
+            model_df["equalized_ber"],
+            marker="o",
+            linewidth=1.5,
+            linestyle="-",
+            label=model_name,
+        )
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel("Trainable Parameters")
+    ax.set_ylabel("BER")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def hidden_overrides(hidden_dim: int) -> Dict[str, int]:
+    return {
+        "HIDDEN_DIM": hidden_dim,
+        "EFFICIENT_KAN_HIDDEN_DIM": hidden_dim,
+        "FASTKAN_HIDDEN_DIM": hidden_dim,
+    }
+
+
+def layer_overrides(layer_count: int) -> Dict[str, int]:
+    return {
+        "EFFICIENT_KAN_LAYERS": layer_count,
+        "FASTKAN_LAYERS": layer_count,
+        "MLP_LAYERS": layer_count,
+    }
+
+
+def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) -> Dict[str, Any]:
     tracked_keys = [
         "CONTEXT_K",
         "SEQ_LEN",
@@ -2190,6 +2425,10 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
         "EFFICIENT_KAN_LAYERS",
         "EFFICIENT_KAN_GRID_SIZE",
         "EFFICIENT_KAN_SPLINE_ORDER",
+        "FASTKAN_HIDDEN_DIM",
+        "FASTKAN_LAYERS",
+        "MLP_LAYERS",
+        "COMPUTE_PER_FILE_METRICS",
     ]
     previous = {key: getattr(Config, key) for key in tracked_keys}
     try:
@@ -2210,6 +2449,9 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
 
 
 def run_sweep_experiments():
+    if Config.RUN_KAN_EXPERIMENT_SUITE:
+        run_kan_experiment_suite()
+        return
     if Config.RUN_EFFICIENT_KAN_SWEEP:
         run_efficient_kan_sweep_experiments()
         return
@@ -2260,6 +2502,150 @@ def run_sweep_experiments():
     plot_sweep_per_model(hidden_df, x_col="hidden_size", x_label="Hidden Size", filename_prefix="ber_vs_hidden")
     plot_sweep_overlay(window_df, x_col="seq_len", x_label="Window Size", filename="ber_vs_window_overlay.png")
     plot_sweep_overlay(hidden_df, x_col="hidden_size", x_label="Hidden Size", filename="ber_vs_hidden_overlay.png")
+
+
+def run_kan_experiment_suite():
+    log("\nRunning KAN/MLP experiment suite...")
+    rows: List[Dict[str, Any]] = []
+
+    base = {
+        "EPOCHS": Config.EXPERIMENT_EPOCHS,
+        "EFFICIENT_KAN_GRID_SIZE": Config.EXPERIMENT_FIXED_GRID,
+        "EFFICIENT_KAN_SPLINE_ORDER": Config.EXPERIMENT_FIXED_SPLINE_ORDER,
+        "COMPUTE_PER_FILE_METRICS": Config.EXPERIMENT_COMPUTE_PER_FILE_METRICS,
+    }
+
+    def run_case(sweep_name: str, model_name: str, **overrides):
+        effective = {**base, **overrides}
+        effective["SEQ_LEN"] = 2 * effective.get("CONTEXT_K", Config.CONTEXT_K) + 1
+        case_id = (
+            f"{sweep_name}_{model_name}_"
+            f"k{effective.get('CONTEXT_K', Config.CONTEXT_K)}_"
+            f"h{effective.get('EFFICIENT_KAN_HIDDEN_DIM', Config.EFFICIENT_KAN_HIDDEN_DIM)}_"
+            f"mlph{effective.get('HIDDEN_DIM', Config.HIDDEN_DIM)}_"
+            f"l{effective.get('EFFICIENT_KAN_LAYERS', Config.EFFICIENT_KAN_LAYERS)}_"
+            f"mlpl{effective.get('MLP_LAYERS', Config.MLP_LAYERS)}_"
+            f"g{effective.get('EFFICIENT_KAN_GRID_SIZE', Config.EFFICIENT_KAN_GRID_SIZE)}_"
+            f"o{effective.get('EFFICIENT_KAN_SPLINE_ORDER', Config.EFFICIENT_KAN_SPLINE_ORDER)}"
+        )
+        log(f"experiment | {case_id}")
+        results = run_model_with_overrides(
+            model_name,
+            max_test_files=Config.EXPERIMENT_TEST_FILES,
+            **effective,
+        )
+        row = {
+            "case_id": case_id,
+            "sweep": sweep_name,
+            "model_type": model_name,
+            "context_k": effective.get("CONTEXT_K", Config.CONTEXT_K),
+            "seq_len": effective.get("SEQ_LEN", Config.SEQ_LEN),
+            "hidden_dim": effective.get("EFFICIENT_KAN_HIDDEN_DIM", effective.get("HIDDEN_DIM", Config.HIDDEN_DIM)),
+            "mlp_hidden_dim": effective.get("HIDDEN_DIM", Config.HIDDEN_DIM),
+            "kan_hidden_dim": effective.get("EFFICIENT_KAN_HIDDEN_DIM", Config.EFFICIENT_KAN_HIDDEN_DIM),
+            "layers": effective.get("EFFICIENT_KAN_LAYERS", effective.get("MLP_LAYERS", Config.MLP_LAYERS)),
+            "mlp_layers": effective.get("MLP_LAYERS", Config.MLP_LAYERS),
+            "kan_layers": effective.get("EFFICIENT_KAN_LAYERS", Config.EFFICIENT_KAN_LAYERS),
+            "grid_size": effective.get("EFFICIENT_KAN_GRID_SIZE", Config.EFFICIENT_KAN_GRID_SIZE),
+            "spline_order": effective.get("EFFICIENT_KAN_SPLINE_ORDER", Config.EFFICIENT_KAN_SPLINE_ORDER),
+            "epochs": effective["EPOCHS"],
+            **results,
+        }
+        rows.append(row)
+        pd.DataFrame(rows).to_csv(Config.OUT_DIR / "kan_experiment_suite_all.csv", index=False)
+
+    for model_name in Config.EXPERIMENT_KAN_MODELS:
+        for grid_size in Config.EXPERIMENT_GRID_VALUES:
+            run_case("ber_vs_grid", model_name, EFFICIENT_KAN_GRID_SIZE=grid_size)
+
+        for spline_order in Config.EXPERIMENT_SPLINE_ORDER_VALUES:
+            run_case("ber_vs_spline_order", model_name, EFFICIENT_KAN_SPLINE_ORDER=spline_order)
+
+    for model_name in Config.EXPERIMENT_COMPARE_MODELS:
+        for hidden_dim in Config.EXPERIMENT_HIDDEN_VALUES:
+            run_case(
+                "kan_mlp_vs_hidden_grid16",
+                model_name,
+                **hidden_overrides(hidden_dim),
+                EFFICIENT_KAN_GRID_SIZE=Config.EXPERIMENT_FIXED_GRID,
+            )
+
+        for context_k in Config.EXPERIMENT_WINDOW_VALUES:
+            run_case(
+                "kan_mlp_vs_window",
+                model_name,
+                CONTEXT_K=context_k,
+                EFFICIENT_KAN_GRID_SIZE=Config.EXPERIMENT_FIXED_GRID,
+            )
+
+        for layer_count in Config.EXPERIMENT_LAYER_VALUES:
+            run_case(
+                "kan_mlp_vs_layers",
+                model_name,
+                **layer_overrides(layer_count),
+                EFFICIENT_KAN_GRID_SIZE=Config.EXPERIMENT_FIXED_GRID,
+            )
+
+    for model_name in Config.EXPERIMENT_COMPLEXITY_MODELS:
+        for hidden_dim in Config.EXPERIMENT_HIDDEN_VALUES:
+            run_case(
+                "ber_vs_complexity",
+                model_name,
+                **hidden_overrides(hidden_dim),
+                EFFICIENT_KAN_GRID_SIZE=Config.EXPERIMENT_FIXED_GRID,
+            )
+
+    df = pd.DataFrame(rows)
+    all_path = Config.OUT_DIR / "kan_experiment_suite_all.csv"
+    df.to_csv(all_path, index=False)
+
+    plot_specs = [
+        ("ber_vs_grid", "grid_size", "Grid Size", "ber_vs_grid.png", "BER vs Grid Size"),
+        (
+            "ber_vs_spline_order",
+            "spline_order",
+            "Spline Order",
+            "ber_vs_spline_order.png",
+            "BER vs Spline Order",
+        ),
+        (
+            "kan_mlp_vs_hidden_grid16",
+            "hidden_dim",
+            "Hidden Dimension",
+            "kan_mlp_ber_vs_hidden_grid16.png",
+            "KAN vs MLP: BER vs Hidden Dim (grid=16)",
+        ),
+        (
+            "kan_mlp_vs_window",
+            "seq_len",
+            "Window Size (symbols)",
+            "kan_mlp_ber_vs_window.png",
+            "KAN vs MLP: BER vs Window Size",
+        ),
+        (
+            "kan_mlp_vs_layers",
+            "layers",
+            "Number of Layers",
+            "kan_mlp_ber_vs_layers.png",
+            "KAN vs MLP: BER vs Number of Layers",
+        ),
+    ]
+    for sweep_name, x_col, x_label, filename, title in plot_specs:
+        sweep_df = df[df["sweep"] == sweep_name].copy()
+        sweep_df.to_csv(Config.OUT_DIR / f"{sweep_name}.csv", index=False)
+        if not sweep_df.empty:
+            plot_experiment_lines(sweep_df, x_col=x_col, x_label=x_label, filename=filename, title=title)
+
+    complexity_df = df[df["sweep"] == "ber_vs_complexity"].copy()
+    complexity_df.to_csv(Config.OUT_DIR / "ber_vs_complexity.csv", index=False)
+    if not complexity_df.empty:
+        plot_experiment_complexity(
+            complexity_df,
+            filename="ber_vs_complexity.png",
+            title="BER vs Complexity",
+        )
+
+    log(f"Saved KAN experiment suite: {all_path}")
 
 
 def run_efficient_kan_sweep_experiments():
@@ -2387,7 +2773,7 @@ def run_efficient_kan_sweep_experiments():
     log(f"Saved EfficientKAN sweep: {Config.OUT_DIR / 'efficient_kan_sweep_all.csv'}")
 
 
-def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.Module, Dict, Dict[str, float]]:
+def train_one_model(model_name: str, data: Dict[str, Any]) -> Tuple[nn.Module, Dict, Dict[str, Any]]:
     model = make_model(model_name)
     trainable_params = count_trainable_parameters(model)
     log(
@@ -2412,6 +2798,9 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
     best_score = float("inf")
     best_state = None
     steps_without_improvement = 0
+    early_stop_without_improvement = 0
+    early_stopped = False
+    stop_reason = "completed"
 
     history = {
         "train_loss": [],
@@ -2545,8 +2934,11 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
         if train_loss < best_train_loss:
             best_train_loss = train_loss
 
-        if val_ber < best_val_ber:
+        if val_ber + Config.EARLY_STOPPING_THRESHOLD < best_val_ber:
             best_val_ber = val_ber
+            early_stop_without_improvement = 0
+        else:
+            early_stop_without_improvement += 1
         if Config.SAVE_BEST_BY == "train_loss":
             monitor_value = train_loss
         elif Config.SAVE_BEST_BY == "val_ber":
@@ -2567,27 +2959,54 @@ def train_one_model(model_name: str, data: Dict[str, torch.Tensor]) -> Tuple[nn.
             new_lr = current_lr * Config.SCHEDULER_FACTOR
             steps_without_improvement = 0
             if new_lr < Config.MIN_LR:
+                stop_reason = "lr_floor"
                 log(f"{model_name} | epoch {epoch+1} -- stopping at lr floor ({current_lr:.6g})")
                 break
             for param_group in optimizer.param_groups:
                 param_group["lr"] = new_lr
             log(f"{model_name} | epoch {epoch+1} -- scheduler reduced lr to {new_lr:.6g}")
 
+        if (
+            Config.EARLY_STOPPING
+            and epoch + 1 >= Config.EARLY_STOPPING_MIN_EPOCHS
+            and early_stop_without_improvement >= Config.EARLY_STOPPING_PATIENCE
+        ):
+            early_stopped = True
+            stop_reason = f"early_stop_val_ber_patience_{Config.EARLY_STOPPING_PATIENCE}"
+            log(
+                f"{model_name} | epoch {epoch+1} -- early stopping: "
+                f"val_ber did not improve for {early_stop_without_improvement} epochs "
+                f"(best_val_ber={best_val_ber:.6e})"
+            )
+            break
+
     if best_state is None:
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     final_metrics = compute_test_metrics(model, {**data, "eval_batch_size": eval_batch_size})
+    if Config.COMPUTE_PER_FILE_METRICS:
+        val_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "val", eval_batch_size)
+        test_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "test", eval_batch_size)
+        add_file_metric_summary(final_metrics, "val", val_file_metrics)
+        add_file_metric_summary(final_metrics, "test", test_file_metrics)
     final_metrics["trainable_params"] = trainable_params
     final_metrics["best_val_ber"] = best_val_ber
     final_metrics["best_train_loss"] = best_train_loss
     final_metrics["train_samples_per_sec"] = float(np.mean(history["train_samples_per_sec"])) if history["train_samples_per_sec"] else 0.0
     final_metrics["mean_epoch_time_sec"] = float(np.mean(history["epoch_time_sec"])) if history["epoch_time_sec"] else 0.0
+    final_metrics["epochs_ran"] = len(history["train_loss"])
+    final_metrics["early_stopped"] = early_stopped
+    final_metrics["stop_reason"] = stop_reason
     return model, history, final_metrics
 
 
 def main():
     Config.OUT_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Device: {Config.DEVICE}")
+
+    if Config.RUN_KAN_EXPERIMENT_SUITE:
+        run_kan_experiment_suite()
+        return
 
     if Config.RUN_SWEEP_EXPERIMENTS and not Config.RUN_MAIN_EXPERIMENTS:
         run_sweep_experiments()
