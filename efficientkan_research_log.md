@@ -901,3 +901,79 @@ Important implementation detail:
 MLP_LAYERS was added so MLP can be swept by number of layers.
 For KAN vs MLP hidden/layer sweeps, the suite applies comparable hidden/layer overrides to both model families.
 ```
+
+### 2026-06-05: Structural KAN pruning and new sequence baselines
+
+Added post-training structural pruning for EfficientKAN-based models.
+
+Important distinction:
+
+```text
+Masking or zeroing KAN weights does not make PyTorch inference faster, because the dense matrix products remain dense.
+The pruning path therefore physically rebuilds a smaller KAN by removing hidden KAN units.
+```
+
+New controls:
+
+```text
+KAN_STRUCTURAL_PRUNE_AFTER_TRAINING = False
+KAN_STRUCTURAL_PRUNE_KEEP_RATIOS = [0.75, 0.5, 0.35, 0.25]
+KAN_STRUCTURAL_PRUNE_FINE_TUNE_EPOCHS = 20
+KAN_STRUCTURAL_PRUNE_SELECT_BY = "efficiency_score"
+EFFICIENCY_BATCH_SIZE = 16000
+EFFICIENCY_SCORE_POWER = 3.0
+```
+
+The efficiency score follows the proposed BER-speed idea:
+
+```text
+score = ((BER_before - BER_after) / BER_before)^3 / time_batch_16k
+```
+
+Pruning protocol:
+
+```text
+1. Train the full KAN normally and restore the best validation checkpoint.
+2. Rank hidden units using incoming/outgoing KAN edge norms.
+3. Build several smaller KAN candidates for different keep ratios.
+4. Fine-tune each candidate.
+5. Evaluate test BER and inference time for a 16000-symbol batch.
+6. Select the candidate with the best configured criterion, defaulting to efficiency_score.
+```
+
+Also added sequence baselines:
+
+```text
+tcn   - dilated temporal convolutional equalizer, no external dependency
+mamba - optional Mamba equalizer via mamba_ssm if installed
+```
+
+### 2026-06-05: Compact FastKAN classifiers
+
+Added two classifier architectures that output 16 constellation logits:
+
+```text
+fastkan_classifier
+    flat normalized IQ window -> compact Gaussian RBF/FastKAN -> 16 classes
+
+complex_fastkan_classifier
+    lightweight complex temporal encoder -> Gaussian RBF/FastKAN -> 16 classes
+```
+
+These models use Gaussian RBF expansions and should be described as FastKAN/RBF-KAN, not RFF-KAN.
+
+Added a dedicated sweep:
+
+```text
+RUN_FASTKAN_CLASSIFIER_SWEEP = True
+```
+
+It evaluates:
+
+```text
+hidden dimensions: [16, 32, 48, 64, 96]
+RBF grid counts:    [4, 8, 12, 16]
+FastKAN layers:     [1, 2]
+```
+
+Outputs include BER, parameter count, inference time for a 16000-symbol batch, and the BER-speed efficiency score.

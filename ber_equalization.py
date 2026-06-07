@@ -1,3 +1,4 @@
+import copy
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -15,6 +16,11 @@ try:
     from efficient_kan import KAN as EfficientKAN
 except ImportError:
     EfficientKAN = None
+
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    Mamba = None
 
 
 class Config:
@@ -45,6 +51,15 @@ class Config:
     TRANSFORMER_HEADS = 4
     TRANSFORMER_FF_DIM = 256
     TRANSFORMER_CONV_KERNEL = 3
+    TCN_HIDDEN_DIM = 96
+    TCN_LAYERS = 5
+    TCN_KERNEL_SIZE = 5
+    TCN_DILATIONS = [1, 2, 4, 8, 16]
+    MAMBA_DIM = 96
+    MAMBA_LAYERS = 4
+    MAMBA_D_STATE = 16
+    MAMBA_D_CONV = 4
+    MAMBA_EXPAND = 2
     COMPLEX_CHANNELS = 24
     COMPLEX_BLOCK_CHANNELS = [24, 32]
     COMPLEX_KERNEL_SIZES = [5, 7]
@@ -88,6 +103,16 @@ class Config:
     KAN_HIDDEN_DROPOUT = 0.1
     KAN_PRUNE_L1 = 1e-5
     KAN_PRUNE_THRESHOLD = 0.02
+    KAN_STRUCTURAL_PRUNE_AFTER_TRAINING = False
+    KAN_STRUCTURAL_PRUNE_KEEP_RATIOS = [0.75, 0.5, 0.35, 0.25]
+    KAN_STRUCTURAL_PRUNE_MIN_HIDDEN = 16
+    KAN_STRUCTURAL_PRUNE_FINE_TUNE_EPOCHS = 20
+    KAN_STRUCTURAL_PRUNE_FINE_TUNE_LR = 2e-4
+    KAN_STRUCTURAL_PRUNE_SELECT_BY = "efficiency_score"
+    EFFICIENCY_BATCH_SIZE = 16000
+    EFFICIENCY_SCORE_POWER = 3.0
+    EFFICIENCY_TIMING_WARMUP = 5
+    EFFICIENCY_TIMING_REPEATS = 20
     EFFICIENT_KAN_HIDDEN_DIM = 128
     EFFICIENT_KAN_LAYERS = 2
     EFFICIENT_KAN_GRID_SIZE = 20
@@ -172,6 +197,14 @@ class Config:
     EXPERIMENT_SPLINE_ORDER_VALUES = [1, 2, 3, 4]
     EXPERIMENT_LAYER_VALUES = [1, 2, 3]
     MLP_LAYERS = 3
+
+    RUN_FASTKAN_CLASSIFIER_SWEEP = True
+    FASTKAN_CLASSIFIER_SWEEP_MODELS = ["fastkan_classifier", "complex_fastkan_classifier"]
+    FASTKAN_CLASSIFIER_SWEEP_EPOCHS = 60
+    FASTKAN_CLASSIFIER_SWEEP_TEST_FILES = 1
+    FASTKAN_CLASSIFIER_HIDDEN_VALUES = [16, 32, 48, 64, 96]
+    FASTKAN_CLASSIFIER_GRID_VALUES = [4, 8, 12, 16]
+    FASTKAN_CLASSIFIER_LAYER_VALUES = [1, 2]
 
 
 if Config.DEVICE.type == "cuda":
@@ -789,6 +822,23 @@ class EfficientKANBaselineEqualizer(nn.Module):
                 return reg
             return torch.tensor(float(reg), device=Config.DEVICE)
         return torch.zeros((), device=Config.DEVICE)
+
+
+class FastKANClassifierEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        input_dim = Config.SEQ_LEN * Config.INPUT_DIM
+        self.head = FastKANHead(
+            input_dim=input_dim,
+            hidden_dim=Config.FASTKAN_HIDDEN_DIM,
+            out_dim=CONSTELLATION.size(0),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return self.head.regularization_loss()
 
 
 def make_efficient_kan(input_dim: int, output_dim: int) -> nn.Module:
@@ -1422,6 +1472,32 @@ class ComplexFastKANEqualizer(nn.Module):
         return self.head.regularization_loss()
 
 
+class ComplexFastKANClassifierEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = LightweightComplexEncoder()
+        fused_dim = 3 * (self.encoder.out_channels + 3) + 2 * Config.INPUT_DIM + 1
+        self.head = FastKANHead(
+            input_dim=fused_dim,
+            hidden_dim=Config.FASTKAN_HIDDEN_DIM,
+            out_dim=CONSTELLATION.size(0),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw, _, seq_features = self.encoder(x)
+        center = seq_features[:, Config.CONTEXT_K, :]
+        mean = seq_features.mean(dim=1)
+        std = seq_features.std(dim=1, unbiased=False)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        raw_mean = raw.mean(dim=1)
+        power_center = raw_center.square().sum(dim=1, keepdim=True)
+        fused = torch.cat([center, mean, std, raw_center, raw_mean, power_center], dim=1)
+        return self.head(fused)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return self.head.regularization_loss()
+
+
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, dim: int, heads: int, ff_dim: int):
         super().__init__()
@@ -1525,6 +1601,164 @@ class TransformerRxEqualizer(nn.Module):
         return self.regressor(fused)
 
 
+class TCNResidualBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dilation: int):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.norm = nn.BatchNorm1d(channels)
+        self.depthwise = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,
+            bias=False,
+        )
+        self.pointwise = nn.Conv1d(channels, channels * 2, kernel_size=1)
+        self.out_proj = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+        self.dropout = nn.Dropout(Config.DROPOUT * 0.5)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in (self.depthwise, self.pointwise, self.out_proj):
+            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if getattr(module, "bias", None) is not None:
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.constant_(self.norm.weight, 1.0)
+        nn.init.constant_(self.norm.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.depthwise(x)
+        value, gate = self.pointwise(x).chunk(2, dim=1)
+        x = self.out_proj(F.gelu(value) * torch.sigmoid(gate))
+        return residual + self.dropout(x)
+
+
+class TCNRxEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        hidden_dim = Config.TCN_HIDDEN_DIM
+        dilations = Config.TCN_DILATIONS[: Config.TCN_LAYERS]
+        if len(dilations) < Config.TCN_LAYERS:
+            dilations = dilations + [dilations[-1] if dilations else 1] * (Config.TCN_LAYERS - len(dilations))
+        self.stem = nn.Sequential(
+            nn.Conv1d(Config.INPUT_DIM, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [TCNResidualBlock(hidden_dim, Config.TCN_KERNEL_SIZE, dilation) for dilation in dilations]
+        )
+        self.final_norm = nn.BatchNorm1d(hidden_dim)
+        fused_dim = hidden_dim * 2 + 2 * Config.INPUT_DIM
+        self.head = nn.Sequential(
+            nn.Linear(fused_dim, Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
+            nn.LayerNorm(Config.HIDDEN_DIM // 2),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.5),
+            nn.Linear(Config.HIDDEN_DIM // 2, 2),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, (nn.BatchNorm1d, nn.LayerNorm)):
+                if hasattr(module, "weight") and module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+                if hasattr(module, "bias") and module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        seq = raw.transpose(1, 2)
+        hidden = self.stem(seq)
+        for block in self.blocks:
+            hidden = block(hidden)
+        hidden = self.final_norm(hidden)
+        center = hidden[:, :, Config.CONTEXT_K]
+        global_context = hidden.mean(dim=2)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        raw_mean = raw.mean(dim=1)
+        return self.head(torch.cat([center, global_context, raw_center, raw_mean], dim=1))
+
+
+class MambaRxEqualizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError(
+                "mamba_ssm is unavailable. Install `mamba-ssm` to run the `mamba` model, "
+                "or keep using `tcn`, `lstm`, and KAN baselines."
+            )
+        dim = Config.MAMBA_DIM
+        self.input_proj = nn.Sequential(
+            nn.Linear(Config.INPUT_DIM, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "norm": nn.LayerNorm(dim),
+                        "mamba": Mamba(
+                            d_model=dim,
+                            d_state=Config.MAMBA_D_STATE,
+                            d_conv=Config.MAMBA_D_CONV,
+                            expand=Config.MAMBA_EXPAND,
+                        ),
+                    }
+                )
+                for _ in range(Config.MAMBA_LAYERS)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(dim)
+        self.head = nn.Sequential(
+            nn.Linear(dim * 2 + Config.INPUT_DIM, Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM // 2),
+            nn.LayerNorm(Config.HIDDEN_DIM // 2),
+            nn.GELU(),
+            nn.Dropout(Config.DROPOUT * 0.5),
+            nn.Linear(Config.HIDDEN_DIM // 2, 2),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.view(x.size(0), Config.SEQ_LEN, Config.INPUT_DIM)
+        hidden = self.input_proj(raw)
+        for block in self.blocks:
+            hidden = hidden + block["mamba"](block["norm"](hidden))
+        hidden = self.final_norm(hidden)
+        center = hidden[:, Config.CONTEXT_K, :]
+        global_context = hidden.mean(dim=1)
+        raw_center = raw[:, Config.CONTEXT_K, :]
+        return self.head(torch.cat([center, global_context, raw_center], dim=1))
+
+
 class MLPRxEqualizer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1599,8 +1833,12 @@ MODEL_NOTES = {
     "efficient_kan_features": "handcrafted local/global IQ features -> KAN -> corrected I/Q",
     "cnn_kan": "CNN extracts temporal features -> KAN head -> corrected I/Q",
     "kan_classifier": "flat IQ window -> KAN -> 16 constellation logits",
+    "fastkan_classifier": "flat IQ window -> compact RBF/FastKAN -> 16 constellation logits",
+    "complex_fastkan_classifier": "light complex encoder -> RBF/FastKAN -> 16 constellation logits",
     "mlp": "flat IQ window -> MLP -> corrected I/Q",
     "cnn": "CNN extracts temporal features -> MLP head -> corrected I/Q",
+    "tcn": "dilated temporal CNN over IQ window -> corrected I/Q",
+    "mamba": "Mamba sequence blocks over IQ window -> corrected I/Q",
 }
 
 
@@ -1994,6 +2232,8 @@ def make_model(name: str) -> nn.Module:
         return CNNKANEqualizer().to(Config.DEVICE)
     if name in {"kan_classifier", "efficient_kan_classifier"}:
         return EfficientKANClassifierEqualizer().to(Config.DEVICE)
+    if name in {"fastkan_classifier", "rbf_kan_classifier"}:
+        return FastKANClassifierEqualizer().to(Config.DEVICE)
     if name == "cnn":
         return CNNRxEqualizer().to(Config.DEVICE)
     if name == "lstm":
@@ -2002,6 +2242,8 @@ def make_model(name: str) -> nn.Module:
         return HybridCNNLSTMEqualizer().to(Config.DEVICE)
     if name in {"complex_fastkan", "fastkan", "kan"}:
         return ComplexFastKANEqualizer().to(Config.DEVICE)
+    if name in {"complex_fastkan_classifier", "complex_rbf_kan_classifier"}:
+        return ComplexFastKANClassifierEqualizer().to(Config.DEVICE)
     if name == "complex_lstm":
         return ComplexLSTMRxEqualizer().to(Config.DEVICE)
     if name == "complex_dbp_seqstat":
@@ -2012,6 +2254,10 @@ def make_model(name: str) -> nn.Module:
         return ComplexCNNRxEqualizer().to(Config.DEVICE)
     if name == "transformer":
         return TransformerRxEqualizer().to(Config.DEVICE)
+    if name == "tcn":
+        return TCNRxEqualizer().to(Config.DEVICE)
+    if name == "mamba":
+        return MambaRxEqualizer().to(Config.DEVICE)
     if name == "mlp":
         return MLPRxEqualizer().to(Config.DEVICE)
     raise ValueError(f"Unknown model: {name}")
@@ -2184,6 +2430,303 @@ def compute_test_metrics(model: nn.Module, data: Dict[str, Any]) -> Dict[str, An
         "improvement_rel": (1 - test_ber / baseline_ber) * 100 if baseline_ber > 0 else 0.0,
         "improvement_db": 10 * np.log10(baseline_ber / test_ber) if test_ber > 0 else float("inf"),
     }
+
+
+def build_optimizer_with_lr(model: nn.Module, lr: float) -> optim.Optimizer:
+    optimizer_kwargs = {"lr": lr, "weight_decay": Config.WEIGHT_DECAY}
+    if Config.DEVICE.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    try:
+        return optim.Adam(model.parameters(), **optimizer_kwargs)
+    except TypeError:
+        optimizer_kwargs.pop("fused", None)
+        return optim.Adam(model.parameters(), **optimizer_kwargs)
+
+
+def get_efficient_kan_module(model: nn.Module) -> Optional[nn.Module]:
+    kan = getattr(model, "kan", None)
+    if kan is None or not hasattr(kan, "layers"):
+        return None
+    layers = list(getattr(kan, "layers"))
+    if not layers or not all(hasattr(layer, "base_weight") and hasattr(layer, "spline_weight") for layer in layers):
+        return None
+    return kan
+
+
+def efficient_kan_layer_sizes(kan: nn.Module) -> List[int]:
+    layers = list(kan.layers)
+    if not layers:
+        return []
+    return [int(layers[0].in_features)] + [int(layer.out_features) for layer in layers]
+
+
+@torch.no_grad()
+def efficient_kan_edge_norm(layer: nn.Module) -> torch.Tensor:
+    base = layer.base_weight.detach().float().abs()
+    spline = layer.scaled_spline_weight.detach().float().abs().mean(dim=2)
+    return base + spline
+
+
+@torch.no_grad()
+def select_efficient_kan_hidden_units(kan: nn.Module, keep_ratio: float) -> List[torch.Tensor]:
+    layers = list(kan.layers)
+    selections: List[torch.Tensor] = []
+    for layer_idx in range(len(layers) - 1):
+        current_layer = layers[layer_idx]
+        next_layer = layers[layer_idx + 1]
+        hidden_size = int(current_layer.out_features)
+        keep_count = max(Config.KAN_STRUCTURAL_PRUNE_MIN_HIDDEN, int(round(hidden_size * keep_ratio)))
+        keep_count = min(hidden_size, max(1, keep_count))
+        incoming = efficient_kan_edge_norm(current_layer).mean(dim=1)
+        outgoing = efficient_kan_edge_norm(next_layer).mean(dim=0)
+        importance = torch.sqrt(incoming.clamp_min(1e-12) * outgoing.clamp_min(1e-12))
+        keep = torch.topk(importance, k=keep_count, largest=True, sorted=False).indices
+        keep = torch.sort(keep.cpu()).values
+        selections.append(keep)
+    return selections
+
+
+@torch.no_grad()
+def copy_pruned_kan_layer(old_layer: nn.Module, new_layer: nn.Module, input_idx: torch.Tensor, output_idx: torch.Tensor):
+    input_idx = input_idx.to(old_layer.base_weight.device)
+    output_idx = output_idx.to(old_layer.base_weight.device)
+    new_layer.grid.copy_(old_layer.grid.index_select(0, input_idx).to(new_layer.grid.device))
+    new_layer.base_weight.copy_(
+        old_layer.base_weight.index_select(0, output_idx).index_select(1, input_idx).to(new_layer.base_weight.device)
+    )
+    new_layer.spline_weight.copy_(
+        old_layer.spline_weight.index_select(0, output_idx)
+        .index_select(1, input_idx)
+        .to(new_layer.spline_weight.device)
+    )
+    if hasattr(old_layer, "spline_scaler") and hasattr(new_layer, "spline_scaler"):
+        new_layer.spline_scaler.copy_(
+            old_layer.spline_scaler.index_select(0, output_idx)
+            .index_select(1, input_idx)
+            .to(new_layer.spline_scaler.device)
+        )
+
+
+def structurally_prune_efficient_kan_model(model: nn.Module, keep_ratio: float) -> Tuple[nn.Module, List[int]]:
+    if EfficientKAN is None:
+        raise ImportError("EfficientKAN is unavailable.")
+    old_kan = get_efficient_kan_module(model)
+    if old_kan is None:
+        raise ValueError("Model does not expose a prunable EfficientKAN module via `.kan`.")
+
+    old_layers = list(old_kan.layers)
+    old_sizes = efficient_kan_layer_sizes(old_kan)
+    hidden_selections = select_efficient_kan_hidden_units(old_kan, keep_ratio)
+    all_indices: List[torch.Tensor] = [
+        torch.arange(old_sizes[0], dtype=torch.long),
+        *hidden_selections,
+        torch.arange(old_sizes[-1], dtype=torch.long),
+    ]
+    new_sizes = [int(idx.numel()) for idx in all_indices]
+    new_kan = EfficientKAN(
+        layers_hidden=new_sizes,
+        grid_size=int(old_kan.grid_size),
+        spline_order=int(old_kan.spline_order),
+        scale_noise=Config.EFFICIENT_KAN_SCALE_NOISE,
+        scale_base=Config.EFFICIENT_KAN_SCALE_BASE,
+        scale_spline=Config.EFFICIENT_KAN_SCALE_SPLINE,
+        base_activation=nn.SiLU,
+        grid_eps=Config.EFFICIENT_KAN_GRID_EPS,
+        grid_range=Config.EFFICIENT_KAN_GRID_RANGE,
+    ).to(Config.DEVICE)
+    for layer_idx, (old_layer, new_layer) in enumerate(zip(old_layers, new_kan.layers)):
+        copy_pruned_kan_layer(old_layer, new_layer, all_indices[layer_idx], all_indices[layer_idx + 1])
+    model.kan = new_kan
+    return model, new_sizes
+
+
+def efficiency_score_from_metrics(metrics: Dict[str, Any]) -> float:
+    baseline = float(metrics.get("baseline_ber", 0.0))
+    equalized = float(metrics.get("equalized_ber", 0.0))
+    batch_time = float(metrics.get("efficiency_batch_time_sec", 0.0))
+    if baseline <= 0 or batch_time <= 0:
+        return 0.0
+    improvement = max((baseline - equalized) / baseline, 0.0)
+    return float(improvement**Config.EFFICIENCY_SCORE_POWER / batch_time)
+
+
+@torch.inference_mode()
+def measure_batch_inference_time(model: nn.Module, x: torch.Tensor) -> float:
+    model.eval()
+    batch_size = min(Config.EFFICIENCY_BATCH_SIZE, x.size(0))
+    if batch_size <= 0:
+        return 0.0
+    xb = x[:batch_size].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
+    for _ in range(Config.EFFICIENCY_TIMING_WARMUP):
+        with autocast_context():
+            mark_cudagraph_step_begin()
+            _ = model(xb)
+    if Config.DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(Config.EFFICIENCY_TIMING_REPEATS):
+        with autocast_context():
+            mark_cudagraph_step_begin()
+            _ = model(xb)
+    if Config.DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    return elapsed / max(Config.EFFICIENCY_TIMING_REPEATS, 1)
+
+
+def add_efficiency_metrics(model: nn.Module, data: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    batch_time = measure_batch_inference_time(model, data["test_x"])
+    metrics["efficiency_batch_size"] = int(min(Config.EFFICIENCY_BATCH_SIZE, data["test_x"].size(0)))
+    metrics["efficiency_batch_time_sec"] = float(batch_time)
+    metrics["efficiency_score"] = efficiency_score_from_metrics(metrics)
+    return metrics
+
+
+def fine_tune_model_for_pruning(
+    model: nn.Module,
+    data: Dict[str, Any],
+    epochs: int,
+    lr: float,
+    eval_batch_size: int,
+) -> Tuple[nn.Module, Dict[str, float], int]:
+    if epochs <= 0:
+        val_loss, val_acc, val_ber, eval_batch_size, val_scale = evaluate_split(
+            model, data["val_x"], data["val_y"], eval_batch_size, scale_search=True
+        )
+        return model, {"val_loss": val_loss, "val_acc": val_acc, "val_ber": val_ber, "val_scale": val_scale}, eval_batch_size
+
+    optimizer = build_optimizer_with_lr(model, lr)
+    criterion = build_criterion()
+    scaler = torch.amp.GradScaler("cuda", enabled=Config.DEVICE.type == "cuda" and Config.USE_AMP)
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_metrics = {"val_loss": float("inf"), "val_acc": 0.0, "val_ber": float("inf"), "val_scale": 1.0}
+    train_block_size = Config.TRAIN_BLOCK_SIZE
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        seen = 0
+        total_train = data["train_x"].size(0)
+        num_blocks = (total_train + train_block_size - 1) // train_block_size
+        for block_idx in torch.randperm(num_blocks).tolist():
+            block_start = block_idx * train_block_size
+            block_end = min(block_start + train_block_size, total_train)
+            xb = data["train_x"][block_start:block_end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
+            yb = data["train_y"][block_start:block_end].to(Config.DEVICE, non_blocking=Config.DEVICE.type == "cuda")
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context():
+                mark_cudagraph_step_begin()
+                preds = model(xb)
+                loss = prediction_loss(preds, yb, criterion) + compute_model_regularization(model)
+            scaler.scale(loss).backward()
+            if Config.GRAD_CLIP_NORM > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRAD_CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item() * yb.size(0)
+            seen += yb.size(0)
+
+        val_loss, val_acc, val_ber, eval_batch_size, val_scale = evaluate_split(
+            model, data["val_x"], data["val_y"], eval_batch_size, scale_search=True
+        )
+        if val_ber < best_metrics["val_ber"]:
+            best_metrics = {"val_loss": val_loss, "val_acc": val_acc, "val_ber": val_ber, "val_scale": val_scale}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        log(
+            f"prune fine-tune | epoch {epoch+1:3d}/{epochs} | "
+            f"train {running_loss / max(seen, 1):.6f} | val_ber {val_ber:.6e}"
+        )
+
+    model.load_state_dict(best_state)
+    return model, best_metrics, eval_batch_size
+
+
+def should_replace_by_pruned(candidate_metrics: Dict[str, Any], best_metrics: Dict[str, Any]) -> bool:
+    mode = Config.KAN_STRUCTURAL_PRUNE_SELECT_BY
+    if mode == "val_ber":
+        return float(candidate_metrics.get("prune_val_ber", float("inf"))) < float(
+            best_metrics.get("prune_val_ber", best_metrics.get("best_val_ber", float("inf")))
+        )
+    if mode == "test_ber":
+        return float(candidate_metrics["equalized_ber"]) < float(best_metrics["equalized_ber"])
+    return float(candidate_metrics.get("efficiency_score", 0.0)) > float(best_metrics.get("efficiency_score", 0.0))
+
+
+def maybe_prune_efficient_kan_model(
+    model: nn.Module,
+    model_name: str,
+    data: Dict[str, Any],
+    base_metrics: Dict[str, Any],
+    eval_batch_size: int,
+) -> Tuple[nn.Module, Dict[str, Any], int]:
+    if not Config.KAN_STRUCTURAL_PRUNE_AFTER_TRAINING:
+        return model, base_metrics, eval_batch_size
+    if get_efficient_kan_module(model) is None:
+        log(f"{model_name} | structural KAN pruning skipped: model has no prunable EfficientKAN `.kan`")
+        return model, base_metrics, eval_batch_size
+
+    base_metrics = add_efficiency_metrics(model, data, base_metrics)
+    base_metrics["pruned"] = False
+    base_metrics["prune_keep_ratio"] = 1.0
+    base_metrics["prune_layer_sizes"] = str(efficient_kan_layer_sizes(get_efficient_kan_module(model)))
+    base_metrics["prune_val_ber"] = base_metrics.get("best_val_ber", float("inf"))
+    best_model = model
+    best_metrics = dict(base_metrics)
+    rows: List[Dict[str, Any]] = [dict(base_metrics, model_type=model_name, prune_candidate="unpruned")]
+
+    for keep_ratio in Config.KAN_STRUCTURAL_PRUNE_KEEP_RATIOS:
+        candidate = copy.deepcopy(model).to(Config.DEVICE)
+        try:
+            candidate, layer_sizes = structurally_prune_efficient_kan_model(candidate, keep_ratio)
+        except Exception as exc:
+            log(f"{model_name} | prune keep_ratio={keep_ratio:.2f} skipped: {exc}")
+            continue
+        candidate_params = count_trainable_parameters(candidate)
+        log(
+            f"{model_name} | prune candidate keep_ratio={keep_ratio:.2f} | "
+            f"layers {layer_sizes} | params {candidate_params:,}"
+        )
+        candidate, val_metrics, eval_batch_size = fine_tune_model_for_pruning(
+            candidate,
+            data,
+            Config.KAN_STRUCTURAL_PRUNE_FINE_TUNE_EPOCHS,
+            Config.KAN_STRUCTURAL_PRUNE_FINE_TUNE_LR,
+            eval_batch_size,
+        )
+        candidate_metrics = compute_test_metrics(candidate, {**data, "eval_batch_size": eval_batch_size})
+        candidate_metrics["trainable_params"] = candidate_params
+        candidate_metrics["pruned"] = True
+        candidate_metrics["prune_keep_ratio"] = float(keep_ratio)
+        candidate_metrics["prune_layer_sizes"] = str(layer_sizes)
+        candidate_metrics["prune_val_loss"] = float(val_metrics["val_loss"])
+        candidate_metrics["prune_val_acc"] = float(val_metrics["val_acc"])
+        candidate_metrics["prune_val_ber"] = float(val_metrics["val_ber"])
+        candidate_metrics = add_efficiency_metrics(candidate, data, candidate_metrics)
+        rows.append(dict(candidate_metrics, model_type=model_name, prune_candidate=f"keep_{keep_ratio:.2f}"))
+        log(
+            f"{model_name} | prune keep_ratio={keep_ratio:.2f} | "
+            f"test_ber {candidate_metrics['equalized_ber']:.6e} | "
+            f"batch16k {candidate_metrics['efficiency_batch_time_sec']:.6f}s | "
+            f"score {candidate_metrics['efficiency_score']:.3f}"
+        )
+        if should_replace_by_pruned(candidate_metrics, best_metrics):
+            best_model = candidate
+            best_metrics = dict(candidate_metrics)
+        elif Config.DEVICE.type == "cuda":
+            candidate.to("cpu")
+            del candidate
+            torch.cuda.empty_cache()
+
+    prune_df = pd.DataFrame(rows)
+    prune_path = Config.OUT_DIR / f"{model_name}_pruning_candidates.csv"
+    prune_df.to_csv(prune_path, index=False)
+    log(
+        f"{model_name} | pruning selected keep_ratio={best_metrics.get('prune_keep_ratio', 1.0)} | "
+        f"test_ber {best_metrics['equalized_ber']:.6e} | "
+        f"score {best_metrics.get('efficiency_score', 0.0):.3f} | saved {prune_path}"
+    )
+    return best_model, best_metrics, eval_batch_size
 
 
 def plot_results(history: Dict, eval_results: Dict, model_name: str):
@@ -2427,6 +2970,7 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
         "EFFICIENT_KAN_SPLINE_ORDER",
         "FASTKAN_HIDDEN_DIM",
         "FASTKAN_LAYERS",
+        "FASTKAN_NUM_GRIDS",
         "MLP_LAYERS",
         "COMPUTE_PER_FILE_METRICS",
     ]
@@ -2448,7 +2992,98 @@ def run_model_with_overrides(model_name: str, max_test_files: int, **overrides) 
             setattr(Config, key, value)
 
 
+def plot_fastkan_classifier_score(df: pd.DataFrame, filename: str):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for model_name, model_df in df.groupby("model_type"):
+        ax.scatter(
+            model_df["trainable_params"],
+            model_df["efficiency_score"],
+            s=70,
+            label=model_name,
+        )
+    ax.set_title("FastKAN Classifiers: BER-Speed Efficiency", fontweight="bold")
+    ax.set_xlabel("Trainable Parameters")
+    ax.set_ylabel("Efficiency Score")
+    ax.set_xscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(Config.OUT_DIR / filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_fastkan_classifier_sweep():
+    log("\nRunning compact FastKAN/RBF-KAN classifier sweep...")
+    rows: List[Dict[str, Any]] = []
+    output_path = Config.OUT_DIR / "fastkan_classifier_sweep_all.csv"
+    base = {
+        "EPOCHS": Config.FASTKAN_CLASSIFIER_SWEEP_EPOCHS,
+        "COMPUTE_PER_FILE_METRICS": False,
+        "FASTKAN_HIDDEN_DIM": Config.FASTKAN_HIDDEN_DIM,
+        "FASTKAN_LAYERS": Config.FASTKAN_LAYERS,
+        "FASTKAN_NUM_GRIDS": Config.FASTKAN_NUM_GRIDS,
+    }
+
+    def run_case(sweep_name: str, model_name: str, **overrides):
+        effective = {**base, **overrides}
+        log(
+            f"fastkan sweep | {sweep_name} | {model_name} | "
+            f"hidden={effective['FASTKAN_HIDDEN_DIM']} | grids={effective['FASTKAN_NUM_GRIDS']} | "
+            f"layers={effective['FASTKAN_LAYERS']}"
+        )
+        results = run_model_with_overrides(
+            model_name,
+            max_test_files=Config.FASTKAN_CLASSIFIER_SWEEP_TEST_FILES,
+            **effective,
+        )
+        rows.append(
+            {
+                "sweep": sweep_name,
+                "model_type": model_name,
+                "hidden_dim": effective["FASTKAN_HIDDEN_DIM"],
+                "num_grids": effective["FASTKAN_NUM_GRIDS"],
+                "layers": effective["FASTKAN_LAYERS"],
+                **results,
+            }
+        )
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+
+    for model_name in Config.FASTKAN_CLASSIFIER_SWEEP_MODELS:
+        for hidden_dim in Config.FASTKAN_CLASSIFIER_HIDDEN_VALUES:
+            run_case("hidden_dim", model_name, FASTKAN_HIDDEN_DIM=hidden_dim)
+        for num_grids in Config.FASTKAN_CLASSIFIER_GRID_VALUES:
+            run_case("num_grids", model_name, FASTKAN_NUM_GRIDS=num_grids)
+        for layers in Config.FASTKAN_CLASSIFIER_LAYER_VALUES:
+            run_case("layers", model_name, FASTKAN_LAYERS=layers)
+
+    df = pd.DataFrame(rows)
+    for sweep_name, x_col, x_label in [
+        ("hidden_dim", "hidden_dim", "Hidden Dimension"),
+        ("num_grids", "num_grids", "RBF Grid Count"),
+        ("layers", "layers", "FastKAN Layers"),
+    ]:
+        sweep_df = df[df["sweep"] == sweep_name].copy()
+        sweep_df.to_csv(Config.OUT_DIR / f"fastkan_classifier_ber_vs_{sweep_name}.csv", index=False)
+        plot_experiment_lines(
+            sweep_df,
+            x_col=x_col,
+            x_label=x_label,
+            filename=f"fastkan_classifier_ber_vs_{sweep_name}.png",
+            title=f"FastKAN Classifier BER vs {x_label}",
+        )
+    plot_experiment_complexity(
+        df,
+        filename="fastkan_classifier_ber_vs_complexity.png",
+        title="FastKAN Classifiers: BER vs Complexity",
+    )
+    plot_fastkan_classifier_score(df, "fastkan_classifier_efficiency_score.png")
+    log(f"Saved FastKAN classifier sweep: {output_path}")
+
+
 def run_sweep_experiments():
+    if Config.RUN_FASTKAN_CLASSIFIER_SWEEP:
+        run_fastkan_classifier_sweep()
+        return
     if Config.RUN_KAN_EXPERIMENT_SUITE:
         run_kan_experiment_suite()
         return
@@ -2984,12 +3619,7 @@ def train_one_model(model_name: str, data: Dict[str, Any]) -> Tuple[nn.Module, D
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     final_metrics = compute_test_metrics(model, {**data, "eval_batch_size": eval_batch_size})
-    if Config.COMPUTE_PER_FILE_METRICS:
-        val_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "val", eval_batch_size)
-        test_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "test", eval_batch_size)
-        add_file_metric_summary(final_metrics, "val", val_file_metrics)
-        add_file_metric_summary(final_metrics, "test", test_file_metrics)
-    final_metrics["trainable_params"] = trainable_params
+    final_metrics["trainable_params"] = count_trainable_parameters(model)
     final_metrics["best_val_ber"] = best_val_ber
     final_metrics["best_train_loss"] = best_train_loss
     final_metrics["train_samples_per_sec"] = float(np.mean(history["train_samples_per_sec"])) if history["train_samples_per_sec"] else 0.0
@@ -2997,12 +3627,37 @@ def train_one_model(model_name: str, data: Dict[str, Any]) -> Tuple[nn.Module, D
     final_metrics["epochs_ran"] = len(history["train_loss"])
     final_metrics["early_stopped"] = early_stopped
     final_metrics["stop_reason"] = stop_reason
+    final_metrics = add_efficiency_metrics(model, data, final_metrics)
+    model, final_metrics, eval_batch_size = maybe_prune_efficient_kan_model(
+        model,
+        model_name,
+        data,
+        final_metrics,
+        eval_batch_size,
+    )
+    final_metrics["trainable_params"] = count_trainable_parameters(model)
+    final_metrics["best_val_ber"] = best_val_ber
+    final_metrics["best_train_loss"] = best_train_loss
+    final_metrics["train_samples_per_sec"] = float(np.mean(history["train_samples_per_sec"])) if history["train_samples_per_sec"] else 0.0
+    final_metrics["mean_epoch_time_sec"] = float(np.mean(history["epoch_time_sec"])) if history["epoch_time_sec"] else 0.0
+    final_metrics["epochs_ran"] = len(history["train_loss"])
+    final_metrics["early_stopped"] = early_stopped
+    final_metrics["stop_reason"] = stop_reason
+    if Config.COMPUTE_PER_FILE_METRICS:
+        val_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "val", eval_batch_size)
+        test_file_metrics, eval_batch_size = compute_split_file_metrics(model, data, "test", eval_batch_size)
+        add_file_metric_summary(final_metrics, "val", val_file_metrics)
+        add_file_metric_summary(final_metrics, "test", test_file_metrics)
     return model, history, final_metrics
 
 
 def main():
     Config.OUT_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Device: {Config.DEVICE}")
+
+    if Config.RUN_FASTKAN_CLASSIFIER_SWEEP:
+        run_fastkan_classifier_sweep()
+        return
 
     if Config.RUN_KAN_EXPERIMENT_SUITE:
         run_kan_experiment_suite()

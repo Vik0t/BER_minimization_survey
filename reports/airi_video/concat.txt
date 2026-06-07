@@ -1,0 +1,15 @@
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_01.png'
+duration 11.696
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_02.png'
+duration 12.596
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_03.png'
+duration 12.596
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_04.png'
+duration 15.295
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_05.png'
+duration 17.994
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_06.png'
+duration 15.295
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_07.png'
+duration 12.596
+file '/Users/vik0t/ml lessons/MNSK/reports/airi_video/slide_07.png'
