@@ -91,6 +91,9 @@ class Config:
     DBP_JOINT_INIT_BATCH_SIZE = 1024
     DBP_JOINT_INIT_LR = 2e-3
     DBP_SEQSTAT_DIM = 128
+    FCNN_HIDDEN_CHANNELS = 32
+    FCNN_HIDDEN_LAYERS = 1
+    FCNN_KERR_INIT_GAMMA = 0.02
 
     FASTKAN_HIDDEN_DIM = 96
     FASTKAN_LAYERS = 2
@@ -572,6 +575,36 @@ class KerrLikeActivation(nn.Module):
         out_real = cos_phase * real + sin_phase * imag
         out_imag = cos_phase * imag - sin_phase * real
         return torch.stack((out_real, out_imag), dim=2).flatten(1, 2)
+
+
+class ComplexFCNNKerrEqualizer(nn.Module):
+    """PyTorch port of the MXNet complex FCNN/Kerr symbol equalizer."""
+
+    def __init__(self):
+        super().__init__()
+        if Config.INPUT_DIM != 2:
+            raise ValueError("complex_fcnn_kerr expects one complex channel (INPUT_DIM=2).")
+        channels = Config.FCNN_HIDDEN_CHANNELS
+        self.input_conv = ComplexConv1d(1, channels, kernel_size=Config.SEQ_LEN)
+        self.input_kerr = KerrLikeActivation(channels, kernel_size=1, init_gamma=Config.FCNN_KERR_INIT_GAMMA)
+        self.hidden = nn.ModuleList(
+            ComplexConv1d(channels, channels, kernel_size=1)
+            for _ in range(Config.FCNN_HIDDEN_LAYERS)
+        )
+        self.hidden_kerr = nn.ModuleList(
+            KerrLikeActivation(channels, kernel_size=1, init_gamma=Config.FCNN_KERR_INIT_GAMMA)
+            for _ in range(Config.FCNN_HIDDEN_LAYERS)
+        )
+        self.output_conv = ComplexConv1d(channels, 1, kernel_size=1)
+        self.output_kerr = KerrLikeActivation(1, kernel_size=1, init_gamma=Config.FCNN_KERR_INIT_GAMMA)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = x.view(x.size(0), Config.SEQ_LEN, 2).transpose(1, 2)
+        state = self.input_conv(seq)[:, :, Config.CONTEXT_K : Config.CONTEXT_K + 1]
+        state = self.input_kerr(state)
+        for linear, kerr in zip(self.hidden, self.hidden_kerr):
+            state = kerr(linear(state))
+        return self.output_kerr(self.output_conv(state)).squeeze(-1)
 
 
 class TemporalConvBlock(nn.Module):
@@ -1835,6 +1868,8 @@ MODEL_NOTES = {
     "kan_classifier": "flat IQ window -> KAN -> 16 constellation logits",
     "fastkan_classifier": "flat IQ window -> compact RBF/FastKAN -> 16 constellation logits",
     "complex_fastkan_classifier": "light complex encoder -> RBF/FastKAN -> 16 constellation logits",
+    "complex_fcnn_kerr": "complex FCNN + learnable Kerr rotations -> corrected I/Q",
+    "complex_dbp_seqstat": "learnable DBP steps + sequence statistics -> corrected I/Q",
     "mlp": "flat IQ window -> MLP -> corrected I/Q",
     "cnn": "CNN extracts temporal features -> MLP head -> corrected I/Q",
     "tcn": "dilated temporal CNN over IQ window -> corrected I/Q",
@@ -2246,6 +2281,8 @@ def make_model(name: str) -> nn.Module:
         return ComplexFastKANClassifierEqualizer().to(Config.DEVICE)
     if name == "complex_lstm":
         return ComplexLSTMRxEqualizer().to(Config.DEVICE)
+    if name == "complex_fcnn_kerr":
+        return ComplexFCNNKerrEqualizer().to(Config.DEVICE)
     if name == "complex_dbp_seqstat":
         return ComplexDBPSeqStatRxEqualizer().to(Config.DEVICE)
     if name == "complex_cnn_lstm":
